@@ -80,7 +80,10 @@ const GUID_VIDEO_POWERDOWN_TIMEOUT: GUID = GUID {
 };
 
 static DEBUG: AtomicBool = AtomicBool::new(false);
-static CONSOLE_OUT: OnceLock<HANDLE> = OnceLock::new();
+// HANDLE is a raw pointer (*mut c_void), which isn't Send/Sync, so it can't
+// live in a static directly. Stash it as a plain pointer-sized integer
+// instead and cast back to HANDLE only at the point of use.
+static CONSOLE_OUT: OnceLock<isize> = OnceLock::new();
 
 macro_rules! log {
     ($($arg:tt)*) => {{
@@ -91,22 +94,17 @@ macro_rules! log {
 }
 
 fn debug_log(msg: &str) {
-    let Some(&handle) = CONSOLE_OUT.get() else {
+    let Some(&addr) = CONSOLE_OUT.get() else {
         return;
     };
-    if handle.is_null() {
+    if addr == 0 {
         return;
     }
+    let handle: HANDLE = addr as HANDLE;
     let text: Vec<u16> = format!("{msg}\r\n").encode_utf16().collect();
     let mut written: u32 = 0;
     unsafe {
-        WriteConsoleW(
-            handle,
-            text.as_ptr() as *const c_void,
-            text.len() as u32,
-            &mut written,
-            ptr::null_mut(),
-        );
+        WriteConsoleW(handle, text.as_ptr(), text.len() as u32, &mut written, ptr::null_mut());
     }
 }
 
@@ -123,7 +121,7 @@ fn init_console(debug: bool) {
             AllocConsole();
         }
         let handle = GetStdHandle(STD_OUTPUT_HANDLE);
-        let _ = CONSOLE_OUT.set(handle);
+        let _ = CONSOLE_OUT.set(handle as isize);
     }
     DEBUG.store(true, Ordering::Relaxed);
     log!("Sleepless starting in debug mode (pid {})", std::process::id());
