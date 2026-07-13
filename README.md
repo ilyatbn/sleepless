@@ -1,7 +1,14 @@
 # Sleepless
 
-A tiny, windowless Windows utility. When run, it:
+A tiny Windows utility to simulate screen-off (using the built-in Blank screensaver) and preventing sleep.  
 
+## Why not use native Windows features?
+Windows 11 ties the Screen Off feature together with Sleep, so you cannot configure one without the other. Another caveat is that when the screen turns off, Windows immediately locks your computer regardless of any settings I tried. This means that tools like PowerToys Awake do not work either while the screen is off, so the computer goes to sleep using the configured OS sleep time. Very odd.
+
+## So what is the point?
+I wanted to protect my OLED monitor from burn-ins while keeping the computer active. At the same time, I wanted to keep my usual sleep timers while I'm actually away. This proved challenging with Windows.   
+
+## How Sleepless solves this issue
 1. Reads your current **sleep** and **screen-off** timeouts (both AC and battery) and saves them.
 2. Sets both to **Never**.
 3. Points the screensaver at Windows' built-in **blank** screensaver and starts it.
@@ -9,12 +16,11 @@ A tiny, windowless Windows utility. When run, it:
    `SystemParametersInfo(SPI_GETSCREENSAVERRUNNING)`.
 5. Restores your original timeouts and screensaver settings, then exits.
 
-No window, no tray icon, no console — unless you pass `/debug`, in which case it attaches to
-the console you launched it from and logs every step.
+While this is not a true replacement for Screen Off, it's the next best thing. Obviously works much better on OLED screens since a blank screensaver basically turns off all the pixels.  
+
 
 ## Build
-
-You'll need the Rust toolchain with the MSVC target (default on Windows):
+You'll need the Rust toolchain with the MSVC target (default on Windows)
 
 ```
 cargo build --release
@@ -49,19 +55,10 @@ sleepless.exe /debug     REM logs everything to the current cmd window
   until a console is attached.
 
 ## Caveats / things worth knowing
-
-- **Not compiled/tested here** — I don't have a Windows machine or network access in the
-  environment I wrote this in, so this hasn't been run through `cargo build`. I verified every
-  function signature against Microsoft's docs and docs.rs for the exact `windows-sys` version
-  pinned in `Cargo.toml`, but if a newer/older `windows-sys` shifts a type slightly, the compiler
-  errors should point at a one-line fix (usually a cast). The most likely spot, if anything: the
-  `HWND_BROADCAST as HWND` cast or the `REG_VALUE_TYPE`/`REG_SAM_FLAGS` constants, if a future
-  crate version wraps them in a newtype instead of a plain `u32`.
 - **No crash/kill-switch recovery**: if the process is killed (Task Manager, `taskkill /F`, log
   off) while the screensaver is up, the original timeouts won't be restored automatically. A
   `Ctrl+C`/console-handler or a "restore last saved values" flag would be a reasonable follow-up
   if that matters to you.
-- The four power-setting GUIDs (`GUID_SLEEP_SUBGROUP`, `GUID_STANDBY_IDLE`,
-  `GUID_VIDEO_SUBGROUP`, `GUID_VIDEO_POWERDOWN_TIMEOUT`) are stable, documented Windows constants,
-  but `windows-sys` doesn't ship them as named constants (they're meant to be supplied by the
-  application), so they're hardcoded from their published values in `main.rs`.
+
+
+#### Code generated almost entirely using Claude.
