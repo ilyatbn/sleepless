@@ -1,0 +1,27 @@
+[package]
+name = "sleepless"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sleepless"
+path = "src/main.rs"
+
+# No console window unless /debug is passed and re-attaches one at runtime.
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
+
+[dependencies]
+# Raw, 1:1 bindings to the Win32 API - deliberately chosen over the higher
+# level `windows` crate so every call here maps directly onto the MSDN
+# signatures with no wrapper-type guessing.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_UI_WindowsAndMessaging",
+] }
