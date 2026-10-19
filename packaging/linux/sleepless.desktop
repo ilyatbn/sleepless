@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Sleepless
+Comment=Turn the display off while keeping the computer awake
+Exec=sleepless
+Icon=sleepless
+Terminal=false
+Categories=Utility;
+Keywords=screen;display;off;sleep;awake;caffeine;

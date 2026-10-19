@@ -4,9 +4,10 @@
 - Repository: `c:\Users\ilya\code\sleepless`
 - Main source: `src/main.rs`
 - Build system: Rust / Cargo
-- Target platform: Windows
+- Target platforms: Windows (src/windows.rs), macOS (src/macos.rs), Linux (src/linux.rs); shared Unix helpers in src/unix.rs
+- Icon: regenerate with `python3 assets/make_icon.py` (needs Pillow)
 - Dependencies:
-  - `windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Power", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }`
+  - Windows only: `windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Power", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }`
 
 ## Key build command
 - `cargo check`
