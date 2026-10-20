@@ -41,15 +41,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release --target x86_64-pc-windows-msvc
+        run: cargo build --release --workspace --target x86_64-pc-windows-msvc
 
       - name: Stage release artifacts
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path dist | Out-Null
           Copy-Item "target\x86_64-pc-windows-msvc\release\sleepless.exe" "dist\sleepless.exe"
+          Copy-Item "target\x86_64-pc-windows-msvc\release\sleepless-gui.exe" "dist\sleepless-gui.exe"
           Copy-Item README.md "dist\README.md"
-          Compress-Archive -Path "dist\sleepless.exe","dist\README.md" -DestinationPath "dist\sleepless-windows-x86_64.zip"
+          Compress-Archive -Path "dist\sleepless.exe","dist\sleepless-gui.exe","dist\README.md" -DestinationPath "dist\sleepless-windows-x86_64.zip"
           Remove-Item "dist\README.md"
 
       - uses: actions/upload-artifact@v4
@@ -70,18 +71,22 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build universal binary
+      - name: Build universal binaries
         run: |
-          cargo build --release --target aarch64-apple-darwin
-          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --workspace --target aarch64-apple-darwin
+          cargo build --release --workspace --target x86_64-apple-darwin
           mkdir -p dist
-          lipo -create -output dist/sleepless \
-            target/aarch64-apple-darwin/release/sleepless \
-            target/x86_64-apple-darwin/release/sleepless
-          lipo -info dist/sleepless
+          for bin in sleepless sleepless-gui; do
+            lipo -create -output "dist/$bin" \
+              "target/aarch64-apple-darwin/release/$bin" \
+              "target/x86_64-apple-darwin/release/$bin"
+            lipo -info "dist/$bin"
+          done
 
-      - name: Build Sleepless.app
-        run: packaging/macos/build-app.sh dist/sleepless "${{ needs.version.outputs.version }}" dist
+      - name: Build Sleepless.app and Sleepless GUI.app
+        run: |
+          packaging/macos/build-app.sh dist/sleepless "${{ needs.version.outputs.version }}" dist
+          packaging/macos/build-gui-app.sh dist/sleepless-gui dist/sleepless "${{ needs.version.outputs.version }}" dist
 
       - name: Stage release artifacts
         run: |
@@ -89,8 +94,9 @@ jobs:
           cd dist
           # ditto keeps the bundle's signature and permissions intact.
           ditto -c -k --keepParent Sleepless.app sleepless-macos-universal-app.zip
-          tar -czf sleepless-macos-universal.tar.gz sleepless README.md
-          rm -rf Sleepless.app sleepless README.md
+          ditto -c -k --keepParent "Sleepless GUI.app" sleepless-macos-universal-gui-app.zip
+          tar -czf sleepless-macos-universal.tar.gz sleepless sleepless-gui README.md
+          rm -rf Sleepless.app "Sleepless GUI.app" sleepless sleepless-gui README.md
 
       - uses: actions/upload-artifact@v4
         with:
@@ -126,15 +132,15 @@ jobs:
       - name: Build release binary
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --workspace --target ${{ matrix.target }}
 
       - name: Stage release artifacts
         run: |
           name=sleepless-linux-${{ matrix.arch }}
           mkdir -p "dist/$name"
-          cp target/${{ matrix.target }}/release/sleepless "dist/$name/"
+          cp target/${{ matrix.target }}/release/sleepless target/${{ matrix.target }}/release/sleepless-gui "dist/$name/"
           cp assets/icon-512.png "dist/$name/sleepless.png"
-          cp packaging/linux/sleepless.desktop packaging/linux/install.sh README.md "dist/$name/"
+          cp packaging/linux/sleepless.desktop packaging/linux/sleepless-gui.desktop packaging/linux/install.sh README.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           rm -rf "dist/$name"
 

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Sleepless (tray)
+Comment=Tray icon to turn the display off while keeping the computer awake
+Exec=sleepless-gui
+Icon=sleepless
+Terminal=false
+Categories=Utility;
+Keywords=screen;display;off;sleep;awake;caffeine;tray;
