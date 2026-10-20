@@ -5,7 +5,7 @@
 // was and exits.
 //
 // Usage:
-//   sleepless [--debug] [--asroot] [--lock]
+//   sleepless [--debug] [--asroot]
 //
 //   --debug    log everything it does (Windows: to the calling cmd window,
 //              macOS/Linux: to stderr). `/debug` also works on Windows.
@@ -13,8 +13,6 @@
 //              and the machine doesn't suspend until you come back.
 //              macOS/Linux ask for your password (sudo / admin prompt)
 //              for the small root helper this needs.
-//   --lock     lock the session too: the black screen only goes away
-//              after you enter your login password on the OS lock screen.
 //
 // Platform specifics live in windows.rs, macos.rs and linux.rs.
 
@@ -52,11 +50,10 @@ mod unix;
 pub struct Options {
     pub debug: bool,
     pub asroot: bool,
-    pub lock: bool,
 }
 
 const USAGE: &str = "\
-Usage: sleepless [--debug] [--asroot] [--lock]
+Usage: sleepless [--debug] [--asroot]
 
 Turns the display off while keeping the machine awake, then restores
 everything once you come back (move the mouse / press a key).
@@ -64,7 +61,6 @@ everything once you come back (move the mouse / press a key).
   --debug    log everything that happens
   --asroot   also keep running with the lid closed (asks for your password
              on macOS/Linux)
-  --lock     require your login password before releasing the black screen
   --help     show this message";
 
 fn parse_args() -> Options {
@@ -78,7 +74,6 @@ fn parse_args() -> Options {
         match name.as_str() {
             "debug" => opts.debug = true,
             "asroot" => opts.asroot = true,
-            "lock" => opts.lock = true,
             "h" | "help" | "?" => {
                 println!("{USAGE}");
                 std::process::exit(0);

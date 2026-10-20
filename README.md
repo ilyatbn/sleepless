@@ -42,17 +42,13 @@ The app isn't signed with an Apple Developer ID, so Gatekeeper will say it *"is 
 3. Double-click Sleepless in Launchpad / Applications. It has no window or Dock icon: the display just turns off. Move the mouse or press a key to come back.
 
 #### Right-click menu
-The first time you open Sleepless.app it adds three Finder **Quick Actions**. Right-click **Sleepless.app** (in Applications or the Dock's *Show in Finder*) and pick **Quick Actions**, then one of:
+The first time you open Sleepless.app it adds a Finder **Quick Action**. Right-click **Sleepless.app** (in Applications or the Dock's *Show in Finder*) and pick **Quick Actions > Sleepless as root** to start it in lid mode (`--asroot`); it asks for your admin password.
 
-- **Sleepless as root**: lid mode (`--asroot`), asks for your admin password
-- **Sleepless with lock**: the black screen needs your login password before it goes away (`--lock`)
-- **Sleepless as root with lock**: both
-
-They're installed into `~/Library/Services` (delete the `Sleepless*.workflow` files there to remove them). The items also appear when you right-click other apps, but they always start Sleepless. If they don't show up, check that they are enabled in System Settings > General > Login Items & Extensions > Finder (on older macOS: Privacy & Security > Extensions > Finder).
+It's installed into `~/Library/Services` (delete `Sleepless as root.workflow` there to remove it). The item also appears when you right-click other apps, but it always starts Sleepless. If it doesn't show up, check that it is enabled in System Settings > General > Login Items & Extensions > Finder (on older macOS: Privacy & Security > Extensions > Finder).
 
 You can also pass options from Terminal:
 ```
-open -a Sleepless --args --asroot --lock
+open -a Sleepless --args --asroot
 ```
 
 ### Linux
@@ -68,7 +64,6 @@ cd sleepless-linux-x86_64
 sleepless                  # silent, display goes off, back when you move the mouse
 sleepless --debug          # log everything (Windows: to the cmd window, also /debug; macOS/Linux: stderr)
 sleepless --asroot         # also allow closing the lid without anything disconnecting or sleeping
-sleepless --lock           # lock the black screen: your login password is needed to release it
 sleepless --help
 ```
 
@@ -84,17 +79,6 @@ Normally closing a laptop lid suspends it, which drops Wi-Fi, SSH sessions, down
 Run Sleepless as your **normal user** and let it ask for the password; don't wrap it in `sudo` yourself. Only a small helper runs as root, and the rest of Sleepless has to stay in your desktop session to control the display. The root helper watches the Sleepless process and undoes its change as soon as Sleepless exits, even if it's killed or crashes.
 
 Coming back: open the lid and move the mouse / press a key. Sleepless restores everything and exits. With the lid shut, the machine keeps running on battery and keeps the heat in, so think twice before putting it in a bag.
-
-### `--lock`: password-protect the black screen
-With `--lock`, coming back to the machine shows the OS lock screen, and Sleepless only lets go (restores your settings, releases the lid helper) once you've unlocked it with your login password. Everything else keeps running: locking doesn't sleep or disconnect anything, and you can combine it with `--asroot`.
-
-| Platform | How |
-| --- | --- |
-| Windows | Turns on the screensaver's *"On resume, display logon screen"* for the session (previous value restored) |
-| macOS | Locks the screen like Ctrl+Cmd+Q before turning the display off, then waits until it's unlocked |
-| Linux | `loginctl lock-session` before turning the display off, then waits for logind to report the session as unlocked (GNOME, KDE and most screen lockers do) |
-
-It uses the OS lock screen rather than a password box of its own on purpose. A homemade fullscreen window can be escaped with Cmd+Tab, Ctrl+Alt+Del, a TTY switch and so on, and it would need to store a password. The real lock screen has neither problem. If the session can't be locked, Sleepless stops before turning the display off, so it never leaves you thinking you're protected when you're not.
 
 ## Build
 You'll need the Rust toolchain.

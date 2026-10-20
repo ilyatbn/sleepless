@@ -7,9 +7,7 @@
 // No admin rights required: changing the timeouts of the *active* power
 // scheme does not require elevation (that's why the Windows power slider
 // doesn't prompt for UAC either). The same goes for --asroot, which only
-// adds the "When I close the lid" action to the settings it changes, and
-// --lock, which turns on "On resume, display logon screen" for the
-// screensaver so dismissing it lands on the Windows lock screen.
+// adds the "When I close the lid" action to the settings it changes.
 
 use std::env;
 use std::ffi::c_void;
@@ -34,8 +32,7 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     SendMessageW, SystemParametersInfoW, HWND_BROADCAST, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE,
-    SPI_GETSCREENSAVEACTIVE, SPI_GETSCREENSAVERRUNNING, SPI_GETSCREENSAVESECURE,
-    SPI_SETSCREENSAVEACTIVE, SPI_SETSCREENSAVESECURE, WM_SYSCOMMAND,
+    SPI_GETSCREENSAVEACTIVE, SPI_GETSCREENSAVERRUNNING, SPI_SETSCREENSAVEACTIVE, WM_SYSCOMMAND,
 };
 
 // SC_SCREENSAVE isn't exposed by windows-sys (it lives in the SC_* window
@@ -301,27 +298,6 @@ pub fn run(opts: crate::Options) {
         screensaver_was_active != 0
     );
 
-    let screensaver_was_secure = opts.lock.then(|| {
-        let mut secure: i32 = 0;
-        unsafe {
-            SystemParametersInfoW(
-                SPI_GETSCREENSAVESECURE,
-                0,
-                &mut secure as *mut _ as *mut c_void,
-                0,
-            );
-            log!("Screensaver password was previously on: {}", secure != 0);
-            log!("Turning on \"On resume, display logon screen\"...");
-            SystemParametersInfoW(
-                SPI_SETSCREENSAVESECURE,
-                1,
-                ptr::null_mut(),
-                SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
-            );
-        }
-        secure
-    });
-
     let blank_saver = env::var("WINDIR")
         .map(|w| format!("{w}\\System32\\scrnsave.scr"))
         .unwrap_or_else(|_| "C:\\Windows\\System32\\scrnsave.scr".to_string());
@@ -403,16 +379,6 @@ pub fn run(opts: crate::Options) {
     }
 
     log!("Restoring screensaver state...");
-    if let Some(secure) = screensaver_was_secure {
-        unsafe {
-            SystemParametersInfoW(
-                SPI_SETSCREENSAVESECURE,
-                secure as u32,
-                ptr::null_mut(),
-                SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
-            );
-        }
-    }
     unsafe {
         SystemParametersInfoW(
             SPI_SETSCREENSAVEACTIVE,

@@ -29,8 +29,6 @@ quick_action() {
         "$here/quick-action/document.wflow" > "$wf/document.wflow"
 }
 quick_action "Sleepless as root"           "--asroot"        "5D1E0A1B-7C2E-4F3A-9B10-00000000A00"
-quick_action "Sleepless with lock"         "--lock"          "5D1E0A1B-7C2E-4F3A-9B10-00000000B00"
-quick_action "Sleepless as root with lock" "--asroot --lock" "5D1E0A1B-7C2E-4F3A-9B10-00000000C00"
 
 # Ad-hoc signature: not a Developer ID (so Gatekeeper still needs the
 # xattr step from the README), but Apple Silicon refuses to run a bundle

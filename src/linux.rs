@@ -9,9 +9,6 @@
 //        - KDE Plasma (X11 or Wayland): kscreen-doctor --dpms
 //        - any other X11 session: xset dpms force off
 //   3. Wait for keyboard/mouse activity, turn the display back on, exit.
-//
-// --lock locks the session (`loginctl lock-session`) before the display
-// goes off and keeps everything in place until logind reports it unlocked.
 
 use std::env;
 use std::thread;
@@ -206,51 +203,6 @@ fn start_inhibitor(opts: crate::Options) {
     log!("Inhibitor lock held ({what}); released automatically when Sleepless exits.");
 }
 
-// ---------------------------------------------------------------------
-// Session lock (--lock)
-// ---------------------------------------------------------------------
-
-fn session_id() -> String {
-    env::var("XDG_SESSION_ID").unwrap_or_else(|_| "self".to_string())
-}
-
-/// logind's LockedHint, which GNOME, KDE and most lockers keep up to date.
-fn session_locked() -> Option<bool> {
-    let id = session_id();
-    let out = run_output(
-        "loginctl",
-        &["show-session", &id, "-p", "LockedHint", "--value"],
-    )?;
-    match out.trim() {
-        "yes" => Some(true),
-        "no" => Some(false),
-        _ => None,
-    }
-}
-
-/// Locks the session and returns whether the lock could be confirmed (and
-/// so later waited on).
-fn lock_session() -> bool {
-    log!("Locking the session...");
-    let id = session_id();
-    if !run_ok("loginctl", &["lock-session", &id]) {
-        fail("could not lock the session (`loginctl lock-session` failed); not turning the display off unprotected");
-    }
-    let mut waited = 0;
-    while session_locked() != Some(true) && waited < 50 {
-        thread::sleep(Duration::from_millis(100));
-        waited += 1;
-    }
-    let locked = session_locked() == Some(true);
-    if !locked {
-        eprintln!(
-            "Sleepless: asked the desktop to lock, but logind never reported the session as locked;\n\
-             Sleepless will exit on activity instead of waiting for the unlock."
-        );
-    }
-    locked
-}
-
 pub fn run(opts: crate::Options) {
     if unix::is_root() && env::var_os("SUDO_USER").is_some() {
         eprintln!(
@@ -262,8 +214,7 @@ pub fn run(opts: crate::Options) {
     // --- 1. Keep the system awake (and ignore the lid with --asroot) ---
     start_inhibitor(opts);
 
-    // --- 2. Lock (optional), then display off ---
-    let watch_lock = opts.lock && lock_session();
+    // --- 2. Display off ---
     let backend = detect_backend();
     log!("Display backend: {backend:?}");
     let x11_dpms_was_enabled =
@@ -298,7 +249,7 @@ pub fn run(opts: crate::Options) {
         Backend::None => false,
     };
 
-    if !returned && !watch_lock {
+    if !returned {
         // Couldn't turn the screen off / watch for input: still useful as
         // a "keep awake" until the user stops it.
         eprintln!(
@@ -328,15 +279,5 @@ pub fn run(opts: crate::Options) {
         }
         _ => {}
     }
-    log!("Display restored.");
-
-    // --- 5. --lock: only let go once the password has been entered ---
-    if watch_lock {
-        log!("Waiting for the session to be unlocked...");
-        while session_locked() != Some(false) {
-            thread::sleep(Duration::from_secs(1));
-        }
-        log!("Session unlocked.");
-    }
-    log!("Releasing the inhibitor lock.");
+    log!("Display restored - releasing the inhibitor lock.");
 }
