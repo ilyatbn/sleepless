@@ -39,10 +39,10 @@ The app isn't signed with an Apple Developer ID, so Gatekeeper will say it *"is 
    xattr -dr com.apple.quarantine /Applications/Sleepless.app
    ```
    (For the command-line binary: `xattr -d com.apple.quarantine ./sleepless`.)
-3. Double-click Sleepless in Launchpad / Applications. It has no window or Dock icon: the display just turns off. Move the mouse or press a key to come back.
+3. Double-click Sleepless in Launchpad / Applications. It has no window or Dock icon: it starts the macOS screensaver and keeps the monitors on (it never turns them off). Move the mouse or press a key to come back. For an all-black screen, pick a dark screensaver in System Settings > Screen Saver.
 
 #### Right-click menu
-The first time you open Sleepless.app it adds a Finder **Quick Action**. Right-click **Sleepless.app** (in Applications or the Dock's *Show in Finder*) and pick **Quick Actions > Sleepless as root** to start it in lid mode (`--asroot`); it asks for your admin password.
+The first time you open Sleepless.app it adds a Finder **Quick Action**. It's a **Finder** item, not a Dock one (macOS only lets an app add Dock menu items while it's running). Right-click **Sleepless.app** in the **Applications folder in Finder** and pick **Quick Actions > Sleepless as root** to start it in lid mode (`--asroot`); it asks for your admin password.
 
 It's installed into `~/Library/Services` (delete `Sleepless as root.workflow` there to remove it). The item also appears when you right-click other apps, but it always starts Sleepless. If it doesn't show up, check that it is enabled in System Settings > General > Login Items & Extensions > Finder (on older macOS: Privacy & Security > Extensions > Finder).
 
@@ -123,9 +123,9 @@ GitHub Actions (`.github/workflows/release.yml`) builds Windows, macOS (universa
   until a console is attached.
 
 ### macOS
-- **Stay awake**: `caffeinate -i -m -s -w <pid>`: a power assertion against idle/system sleep (but not display sleep) that ends by itself when Sleepless exits.
-- **Display off**: `pmset displaysleepnow`.
-- **Waiting**: polls CoreGraphics' `CGEventSourceSecondsSinceLastEventType` (HID idle time) and exits as soon as it drops, i.e. on any keyboard/mouse input. macOS wakes the display on its own.
+- **Stay awake**: `caffeinate -d -i -m -s -w <pid>`: power assertions against display and system sleep that end by itself when Sleepless exits. The monitors are never turned off, because on macOS that's what brings up the lock screen.
+- **Screensaver**: starts `ScreenSaverEngine`, the same as hot corners / "Start Screen Saver". It uses whichever screensaver you've picked in System Settings.
+- **Waiting**: polls CoreGraphics' `CGEventSourceSecondsSinceLastEventType` (HID idle time) and exits as soon as it drops, i.e. on any keyboard/mouse input, which also dismisses the screensaver.
 
 ### Linux
 - **Stay awake**: `systemd-inhibit --mode=block --what=sleep:idle` (plus `handle-lid-switch` with `--asroot`) wrapped around a tiny shell loop that exits when Sleepless does. `elogind-inhibit` works too.
@@ -143,7 +143,10 @@ GitHub Actions (`.github/workflows/release.yml`) builds Windows, macOS (universa
   held by helper processes that clean up when Sleepless exits.)
 - **Lock screen**: if your OS is set to require a password after the display turns off / the
   screensaver starts, you'll still get the lock screen when you come back. That's by design;
-  Sleepless doesn't touch security settings.
+  Sleepless doesn't touch security settings. On macOS this is System Settings > Lock Screen >
+  "Require password after screen saver begins or display is turned off": the same setting
+  covers the screensaver, so if it's set to *Immediately* you'll still see the lock screen
+  when you dismiss it.
 
 
 #### Code generated almost entirely using Claude.

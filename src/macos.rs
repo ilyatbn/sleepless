@@ -1,15 +1,18 @@
 // macOS backend
 //
-//   1. `caffeinate -i -m -s -w <our pid>` holds a power assertion that
-//      stops idle/system sleep (but deliberately not display sleep). The
-//      -w makes it exit by itself the moment we do.
+//   1. `caffeinate -d -i -m -s -w <our pid>` holds power assertions that
+//      stop display and system sleep, so the monitors stay on (turning
+//      them off is what brings the lock screen up). The -w makes it exit
+//      by itself the moment we do.
 //   2. --asroot: a root helper runs `pmset -a disablesleep 1`, which is
 //      what stops a MacBook from sleeping when the lid closes, then waits
 //      for us to exit and puts the previous value back.
-//   3. `pmset displaysleepnow` turns the display off.
+//   3. Start the system screensaver (ScreenSaverEngine), same idea as the
+//      blank screensaver on Windows. Pick a dark one in System Settings >
+//      Screen Saver for an all-black screen.
 //   4. Wait for keyboard/mouse activity (CoreGraphics' HID idle counter),
-//      then exit - which releases both helpers. macOS wakes the display
-//      by itself on input.
+//      which also dismisses the screensaver, then exit - releasing both
+//      helpers.
 //
 // When run from Sleepless.app it also installs the app's Finder Quick
 // Action (right-click > Quick Actions > "Sleepless as root") into
@@ -108,7 +111,7 @@ pub fn run(opts: crate::Options) {
 
     // --- 1. Keep the system awake ---
     let pid = std::process::id().to_string();
-    let caffeinate = ["caffeinate", "-i", "-m", "-s", "-w", &pid].map(String::from);
+    let caffeinate = ["caffeinate", "-d", "-i", "-m", "-s", "-w", &pid].map(String::from);
     let mut caffeinate =
         spawn(&caffeinate).unwrap_or_else(|e| fail(&format!("could not start caffeinate: {e}")));
     log!("caffeinate is holding a no-sleep assertion.");
@@ -136,10 +139,15 @@ pub fn run(opts: crate::Options) {
         log!("Lid-close sleep disabled; it will be restored when Sleepless exits.");
     }
 
-    // --- 3. Display off ---
-    log!("Turning the display off...");
-    if !run_ok("pmset", &["displaysleepnow"]) {
-        fail("`pmset displaysleepnow` failed");
+    // --- 3. Screensaver ---
+    log!("Starting the screensaver...");
+    if !run_ok("open", &["-a", "ScreenSaverEngine"])
+        && !run_ok(
+            "open",
+            &["/System/Library/CoreServices/ScreenSaverEngine.app"],
+        )
+    {
+        fail("could not start the screensaver (ScreenSaverEngine)");
     }
 
     // --- 4. Wait for the user to come back ---
