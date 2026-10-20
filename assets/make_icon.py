@@ -34,17 +34,17 @@ def vein(draw, x, y, angle, length, width, depth=0):
     """Wobbly, tapering, branching red line."""
     seg = S * 0.012
     travelled = 0.0
-    while travelled < length and width > 2:
+    while travelled < length and width > 1.5:
         angle += rng.uniform(-0.45, 0.45)
         nx = x + math.cos(angle) * seg
         ny = y + math.sin(angle) * seg
-        draw.line([(x, y), (nx, ny)], fill=(190, 18, 28, 235), width=int(width))
+        draw.line([(x, y), (nx, ny)], fill=(200, 40, 50, 150), width=int(width))
         draw.ellipse([nx - width / 2, ny - width / 2, nx + width / 2, ny + width / 2],
-                     fill=(190, 18, 28, 235))
+                     fill=(200, 40, 50, 150))
         x, y = nx, ny
         travelled += seg
-        width *= 0.965
-        if depth < 3 and rng.random() < 0.11:
+        width *= 0.975
+        if depth < 3 and rng.random() < 0.08:
             vein(draw, x, y, angle + rng.choice([-1, 1]) * rng.uniform(0.5, 1.1),
                  (length - travelled) * 0.7, width * 0.75, depth + 1)
 
@@ -59,20 +59,20 @@ def eye(img, cx, cy, w, h, look):
     fd = ImageDraw.Draw(flush)
     for side in (-1, 1):
         fx = cx + side * w * 0.42
-        fd.ellipse([fx - w * 0.28, cy - h * 0.5, fx + w * 0.28, cy + h * 0.5], fill=150)
+        fd.ellipse([fx - w * 0.28, cy - h * 0.5, fx + w * 0.28, cy + h * 0.5], fill=90)
     flush = flush.filter(ImageFilter.GaussianBlur(S * 0.03))
     sclera = Image.composite(Image.new("RGBA", (S, S), (236, 120, 120, 255)), sclera, flush)
 
     # Veins creep in from the rim towards the iris.
     veins = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     vd = ImageDraw.Draw(veins)
-    for i in range(16):
+    for i in range(12):
         side = -1 if i % 2 else 1
         t = rng.uniform(-0.9, 0.9)
         sx = cx + side * w / 2 * rng.uniform(0.55, 1.0)
         sy = cy + t * h * 0.42
         ang = math.atan2(cy - sy, cx - sx) + rng.uniform(-0.35, 0.35)
-        vein(vd, sx, sy, ang, w * rng.uniform(0.18, 0.34), S * rng.uniform(0.006, 0.011))
+        vein(vd, sx, sy, ang, w * rng.uniform(0.12, 0.24), S * rng.uniform(0.0025, 0.0045))
     veins = veins.filter(ImageFilter.GaussianBlur(S * 0.0012))
     sclera = Image.alpha_composite(sclera, veins)
 

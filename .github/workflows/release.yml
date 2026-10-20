@@ -4,7 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish as a pre-release (e.g. v0.2beta). Leave empty to use v<Cargo.toml version>."
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -153,8 +158,13 @@ jobs:
       - name: Create / update release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ needs.version.outputs.version }}
-          name: Sleepless v${{ needs.version.outputs.version }}
-          make_latest: true
+          # A manual run with a custom tag (e.g. a beta from a feature
+          # branch) is published as a pre-release on that exact commit and
+          # doesn't become "Latest".
+          tag_name: ${{ inputs.tag || format('v{0}', needs.version.outputs.version) }}
+          name: Sleepless ${{ inputs.tag || format('v{0}', needs.version.outputs.version) }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ inputs.tag != '' && inputs.tag != null }}
+          make_latest: ${{ (inputs.tag == '' || inputs.tag == null) && 'true' || 'false' }}
           generate_release_notes: true
           files: dist/*
