@@ -5,6 +5,7 @@
 //
 //   Turn display off          runs `sleepless`, plus `--asroot` when...
 //   Keep awake with lid closed   ...this is ticked (remembered between runs)
+//                             also on a global shortcut, see hotkey.rs
 //   Launch at login           adds / removes an autostart entry
 //   Quit
 //
@@ -15,11 +16,12 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod autostart;
+mod hotkey;
 
 use std::cell::RefCell;
 use std::env;
 use std::fs::{self, File};
-use std::io::Cursor;
+use std::io::{self, Cursor};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,8 +30,10 @@ use std::thread;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-/// Set while a `sleepless` session started from the menu is still running.
+/// Set while a `sleepless` session started from here is still running.
 static RUNNING: AtomicBool = AtomicBool::new(false);
+/// Settings::asroot, readable from the hotkey thread.
+static ASROOT: AtomicBool = AtomicBool::new(false);
 
 struct App {
     tray: Option<TrayIcon>,
@@ -38,6 +42,7 @@ struct App {
     login: CheckMenuItem,
     quit: MenuItem,
     settings: Settings,
+    _hotkey: Option<global_hotkey::GlobalHotKeyManager>,
 }
 
 // Menu items aren't Send, so the app lives on the main thread and every
@@ -127,36 +132,53 @@ fn sleepless_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
+pub fn is_running() -> bool {
+    RUNNING.load(Ordering::SeqCst)
+}
+
+/// Runs `sleepless` unless a session started from here is still going.
+/// Called from the menu (main thread) and the shortcut (any thread).
+pub fn start_session() -> io::Result<()> {
+    if RUNNING.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    let path = sleepless_path();
+    let mut cmd = Command::new(&path);
+    if ASROOT.load(Ordering::SeqCst) {
+        cmd.arg("--asroot");
+    }
+    match cmd.spawn() {
+        Ok(mut child) => {
+            thread::spawn(move || {
+                let _ = child.wait();
+                RUNNING.store(false, Ordering::SeqCst);
+            });
+            Ok(())
+        }
+        Err(e) => {
+            RUNNING.store(false, Ordering::SeqCst);
+            Err(io::Error::new(
+                e.kind(),
+                format!("could not run {}: {e}", path.display()),
+            ))
+        }
+    }
+}
+
 impl App {
     fn turn_display_off(&mut self) {
-        if RUNNING.load(Ordering::SeqCst) {
-            return;
-        }
-        let path = sleepless_path();
-        let mut cmd = Command::new(&path);
-        if self.settings.asroot {
-            cmd.arg("--asroot");
-        }
-        match cmd.spawn() {
-            Ok(mut child) => {
-                RUNNING.store(true, Ordering::SeqCst);
-                thread::spawn(move || {
-                    let _ = child.wait();
-                    RUNNING.store(false, Ordering::SeqCst);
-                });
-            }
-            Err(e) => {
-                let msg = format!("Sleepless: could not run {}: {e}", path.display());
-                eprintln!("{msg}");
-                if let Some(tray) = &self.tray {
-                    let _ = tray.set_tooltip(Some(msg));
-                }
+        if let Err(e) = start_session() {
+            let msg = format!("Sleepless: {e}");
+            eprintln!("{msg}");
+            if let Some(tray) = &self.tray {
+                let _ = tray.set_tooltip(Some(msg));
             }
         }
     }
 
     fn toggle_lid(&mut self) {
         self.settings.asroot = !self.settings.asroot;
+        ASROOT.store(self.settings.asroot, Ordering::SeqCst);
         self.settings.save();
         self.lid.set_checked(self.settings.asroot);
     }
@@ -212,6 +234,7 @@ fn load_icon(png_bytes: &[u8]) -> Icon {
 
 fn build_app() -> tray_icon::Result<App> {
     let settings = Settings::load();
+    ASROOT.store(settings.asroot, Ordering::SeqCst);
     let login_enabled = autostart::is_enabled();
     if login_enabled {
         // Point the login item at wherever we live now, in case the app
@@ -219,7 +242,14 @@ fn build_app() -> tray_icon::Result<App> {
         let _ = autostart::set(true);
     }
 
-    let start = MenuItem::new("Turn display off", true, None);
+    let hotkey = hotkey::register();
+    let start = match hotkey.is_some() {
+        true => {
+            let (label, accel) = hotkey::label_and_accelerator();
+            MenuItem::new(label, true, accel)
+        }
+        false => MenuItem::new("Turn display off", true, None),
+    };
     let lid = CheckMenuItem::new(
         "Keep awake with the lid closed (--asroot)",
         true,
@@ -259,6 +289,7 @@ fn build_app() -> tray_icon::Result<App> {
         login,
         quit,
         settings,
+        _hotkey: hotkey,
     })
 }
 

@@ -13,6 +13,9 @@ path = "src/main.rs"
 # install or cross-compile against.
 tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
 png = "0.18"
+# Ctrl+Cmd+S / Ctrl+Win+S. Pure Rust on Linux too (x11rb talks to the X
+# server directly).
+global-hotkey = "0.9"
 
 # Embeds assets/icon.ico into sleepless-gui.exe (Windows builds only).
 [target.'cfg(windows)'.build-dependencies]
@@ -23,8 +26,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(not(any(windows, target_os = "macos")))'.dependencies]
+x11rb = "0.13"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

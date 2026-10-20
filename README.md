@@ -33,12 +33,14 @@ Grab the latest build from the [Releases](../../releases) page:
 ## Tray / menu bar icon (`sleepless-gui`)
 `sleepless-gui` puts a Sleepless icon in the Windows taskbar tray, the macOS menu bar or the Linux system tray. Its menu:
 
-- **Turn display off**: runs `sleepless` (with `--asroot` if the next item is ticked).
+- **Turn display off**: runs `sleepless` (with `--asroot` if the next item is ticked). Also on a global keyboard shortcut: **Ctrl+Cmd+S** on macOS, **Ctrl+Win+S** on Windows, **Ctrl+Super+S** on Linux. It waits until you let go of the keys, so releasing them doesn't wake the screen right back up.
 - **Keep awake with the lid closed (--asroot)**: remembered between runs.
 - **Launch at login**: starts the tray icon when you log in. It uses each system's own per-user mechanism, so you can also see / remove it there: the `Sleepless` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (Task Manager > Startup apps), `~/Library/LaunchAgents/io.github.ilyatbn.sleepless-gui.plist` (System Settings > General > Login Items) or `~/.config/autostart/sleepless-gui.desktop`.
 - **Quit Sleepless**: removes the icon. A screen-off session that's already running carries on until you come back.
 
 It's only a launcher: it looks for the `sleepless` command-line tool next to itself (then on `PATH`), so keep the two together. On macOS, Sleepless GUI.app already contains it; install it the same way as Sleepless.app below, including the `xattr` step. Only one tray icon runs per user; starting it again does nothing.
+
+If another app already owns the shortcut, the menu item just shows no shortcut. On Linux the shortcut only works in an X11 session: Wayland doesn't let apps grab keys, so bind a custom shortcut to `sleepless` in your desktop's keyboard settings instead.
 
 On Linux the icon uses the StatusNotifierItem tray (KDE Plasma, Ubuntu, XFCE, Cinnamon...). Stock GNOME has no tray: install the *AppIndicator and KStatusNotifierItem Support* extension.
 
