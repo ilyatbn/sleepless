@@ -283,21 +283,21 @@ fn build_app() -> tray_icon::Result<App> {
     ])
     .expect("tray menu");
 
-    // Just the eyes: wide on the macOS menu bar, square in the other trays.
-    #[cfg(target_os = "macos")]
-    let icon = load_icon(include_bytes!("../../assets/tray-mac.png"));
-    #[cfg(not(target_os = "macos"))]
-    let icon = load_icon(include_bytes!("../../assets/tray.png"));
-
     // Left click turns the display off, right click opens the menu.
     TrayIconEvent::set_event_handler(Some(on_tray_click));
     let tray = TrayIconBuilder::new()
         .with_id("sleepless")
         .with_tooltip("Sleepless: click to turn the display off, right-click for options")
-        .with_icon(icon)
         .with_menu(Box::new(menu))
-        .with_menu_on_left_click(false)
-        .build()?;
+        .with_menu_on_left_click(false);
+    // macOS menu bar icons are monochrome "template" images that the
+    // system tints to match the bar; just the colour eyes elsewhere.
+    #[cfg(target_os = "macos")]
+    let tray =
+        tray.with_icon_templated(load_icon(include_bytes!("../../assets/tray-template.png")));
+    #[cfg(not(target_os = "macos"))]
+    let tray = tray.with_icon(load_icon(include_bytes!("../../assets/tray.png")));
+    let tray = tray.build()?;
 
     Ok(App {
         tray: Some(tray),

@@ -107,9 +107,9 @@ def eye(img, cx, cy, w, h, look):
 
 
 def tray():
-    """Small icons for sleepless-gui, just the eyes on a transparent
-    background: tray.png (square, Windows / Linux trays) and tray-mac.png
-    (wide, 22pt tall @2x for the macOS menu bar)."""
+    """Small icons for sleepless-gui: tray.png (just the eyes, square, for
+    Windows / Linux trays) and tray-template.png (macOS menu bar: black on
+    transparent, macOS tints it to match the bar)."""
     rng.seed(7)
     img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     w, h = S * 0.38, S * 0.27
@@ -122,9 +122,26 @@ def tray():
     sq.paste(eyes, (0, (ew - eh) // 2))
     sq.resize((64, 64), Image.LANCZOS).save(os.path.join(OUT, "tray.png"))
 
-    mac_h = 36  # leaves a little padding inside the 44px (22pt) bar
-    eyes.resize((round(ew * mac_h / eh), mac_h), Image.LANCZOS).save(
-        os.path.join(OUT, "tray-mac.png"))
+    T = 44 * 16  # 22pt @2x, supersampled
+    img = Image.new("L", (T, T), 0)
+    d = ImageDraw.Draw(img)
+    w, h = T * 0.44, T * 0.36
+    for cx in (T * 0.26, T * 0.74):
+        cy = T * 0.5
+        d.polygon(almond(cx, cy, w, h), fill=255)
+        d.polygon(almond(cx, cy, w * 0.78, h * 0.62), fill=0)
+        r = h * 0.24
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=255)
+        # Droopy lid across the top of the eye.
+        d.rectangle([cx - w / 2, cy - h / 2, cx + w / 2, cy - h * 0.12], fill=255)
+        d.polygon(almond(cx, cy, w, h), outline=255)
+    keep = Image.new("L", (T, T), 0)
+    for cx in (T * 0.26, T * 0.74):
+        ImageDraw.Draw(keep).polygon(almond(cx, T * 0.5, w, h), fill=255)
+    alpha = ImageChops.multiply(img, keep).resize((44, 44), Image.LANCZOS)
+    out = Image.new("RGBA", (44, 44), (0, 0, 0, 0))
+    out.putalpha(alpha)
+    out.save(os.path.join(OUT, "tray-template.png"))
 
 
 def main():
