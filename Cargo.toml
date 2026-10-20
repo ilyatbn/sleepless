@@ -23,6 +23,27 @@ lto = true
 strip = true
 panic = "abort"
 
+# The black full-screen windows on macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSColor",
+    "NSCursor",
+    "NSGraphics",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSScreen",
+    "NSWindow",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSEnumerator",
+    "NSGeometry",
+] }
+
 [target.'cfg(windows)'.dependencies]
 # Raw, 1:1 bindings to the Win32 API - deliberately chosen over the higher
 # level `windows` crate so every call here maps directly onto the MSDN

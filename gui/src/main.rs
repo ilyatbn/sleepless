@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 /// Set while a `sleepless` session started from here is still running.
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -192,6 +192,21 @@ impl App {
     }
 }
 
+/// Runs on the main thread on Windows / macOS and on the tray's D-Bus
+/// thread on Linux, so it only touches thread-safe state.
+fn on_tray_click(event: TrayIconEvent) {
+    if let TrayIconEvent::Click {
+        button: MouseButton::Left,
+        button_state: MouseButtonState::Up,
+        ..
+    } = event
+    {
+        if let Err(e) = start_session() {
+            eprintln!("Sleepless: {e}");
+        }
+    }
+}
+
 fn handle(event: MenuEvent) {
     APP.with_borrow_mut(|app| {
         let Some(app) = app else { return };
@@ -268,19 +283,21 @@ fn build_app() -> tray_icon::Result<App> {
     ])
     .expect("tray menu");
 
+    // Just the eyes: wide on the macOS menu bar, square in the other trays.
+    #[cfg(target_os = "macos")]
+    let icon = load_icon(include_bytes!("../../assets/tray-mac.png"));
+    #[cfg(not(target_os = "macos"))]
+    let icon = load_icon(include_bytes!("../../assets/tray.png"));
+
+    // Left click turns the display off, right click opens the menu.
+    TrayIconEvent::set_event_handler(Some(on_tray_click));
     let tray = TrayIconBuilder::new()
         .with_id("sleepless")
-        .with_title("Sleepless")
-        .with_tooltip("Sleepless")
-        .with_menu(Box::new(menu));
-    // macOS menu bar icons are monochrome "template" images that the
-    // system tints to match the bar; the full-colour icon elsewhere.
-    #[cfg(target_os = "macos")]
-    let tray =
-        tray.with_icon_templated(load_icon(include_bytes!("../../assets/tray-template.png")));
-    #[cfg(not(target_os = "macos"))]
-    let tray = tray.with_icon(load_icon(include_bytes!("../../assets/tray.png")));
-    let tray = tray.build()?;
+        .with_tooltip("Sleepless: click to turn the display off, right-click for options")
+        .with_icon(icon)
+        .with_menu(Box::new(menu))
+        .with_menu_on_left_click(false)
+        .build()?;
 
     Ok(App {
         tray: Some(tray),

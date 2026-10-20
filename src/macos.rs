@@ -7,11 +7,14 @@
 //   2. --asroot: a root helper runs `pmset -a disablesleep 1`, which is
 //      what stops a MacBook from sleeping when the lid closes, then waits
 //      for us to exit and puts the previous value back.
-//   3. Start the system screensaver (ScreenSaverEngine), same idea as the
-//      blank screensaver on Windows. Pick a dark one in System Settings >
-//      Screen Saver for an all-black screen.
-//   4. Wait for keyboard/mouse activity (CoreGraphics' HID idle counter),
-//      which also dismisses the screensaver, then exit - releasing both
+//   3. Cover every display with a borderless black window above
+//      everything else (menu bar, Dock, full-screen apps), with the cursor
+//      hidden. Not the system screensaver: on recent macOS that shows the
+//      lock-screen clock and wallpaper, and asking for a password after it
+//      is a common setting.
+//   4. Wait for keyboard/mouse activity (CoreGraphics' HID idle counter)
+//      on a background thread while AppKit runs the windows on the main
+//      thread, then exit - which removes the windows and releases both
 //      helpers.
 //
 // When run from Sleepless.app it also installs the app's Finder Quick
@@ -20,11 +23,21 @@
 
 use std::path::Path;
 use std::time::Duration;
-use std::{env, fs, io};
+use std::{env, fs, io, thread};
+
+use objc2::rc::Retained;
+use objc2::{MainThreadMarker, MainThreadOnly};
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSCursor, NSScreen,
+    NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
+};
 
 use crate::unix::{self, fail, run_ok, run_output, spawn, spawn_as_root, wait_for_our_exit_sh};
 
 pub use crate::unix::{debug_log, init_logging};
+
+// NSScreenSaverWindowLevel: above the menu bar, Dock and full-screen apps.
+const SCREEN_SAVER_WINDOW_LEVEL: isize = 1000;
 
 // kCGEventSourceStateHIDSystemState / kCGAnyInputEventType
 const HID_SYSTEM_STATE: i32 = 1;
@@ -98,6 +111,49 @@ fn install_quick_actions() {
     }
 }
 
+/// Puts a black, borderless window over every display. They stay up until
+/// the process exits.
+fn black_out(mtm: MainThreadMarker) -> Vec<Retained<NSWindow>> {
+    let app = NSApplication::sharedApplication(mtm);
+    // No Dock icon, but still able to come to the front, so the keypress
+    // that brings you back lands here rather than in whatever app was
+    // active.
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    let windows: Vec<_> = NSScreen::screens(mtm)
+        .iter()
+        .map(|screen| {
+            let frame = screen.frame();
+            let window = unsafe {
+                NSWindow::initWithContentRect_styleMask_backing_defer(
+                    NSWindow::alloc(mtm),
+                    frame,
+                    NSWindowStyleMask::Borderless,
+                    NSBackingStoreType::Buffered,
+                    false,
+                )
+            };
+            unsafe { window.setReleasedWhenClosed(false) };
+            window.setBackgroundColor(Some(&NSColor::blackColor()));
+            window.setLevel(SCREEN_SAVER_WINDOW_LEVEL);
+            window.setCollectionBehavior(
+                NSWindowCollectionBehavior::CanJoinAllSpaces
+                    | NSWindowCollectionBehavior::Stationary
+                    | NSWindowCollectionBehavior::FullScreenAuxiliary
+                    | NSWindowCollectionBehavior::IgnoresCycle,
+            );
+            window.setHasShadow(false);
+            window.setFrame_display(frame, true);
+            window.orderFrontRegardless();
+            window
+        })
+        .collect();
+    log!("Blacked out {} display(s).", windows.len());
+    #[allow(deprecated)] // activate() is macOS 14+; this still works there
+    app.activateIgnoringOtherApps(true);
+    NSCursor::hide();
+    windows
+}
+
 fn sleep_disabled() -> Option<bool> {
     let out = run_output("pmset", &["-g"])?;
     out.lines()
@@ -139,20 +195,20 @@ pub fn run(opts: crate::Options) {
         log!("Lid-close sleep disabled; it will be restored when Sleepless exits.");
     }
 
-    // --- 3. Screensaver ---
-    log!("Starting the screensaver...");
-    if !run_ok("open", &["-a", "ScreenSaverEngine"])
-        && !run_ok(
-            "open",
-            &["/System/Library/CoreServices/ScreenSaverEngine.app"],
-        )
-    {
-        fail("could not start the screensaver (ScreenSaverEngine)");
-    }
+    // --- 3. Black screen ---
+    let mtm = MainThreadMarker::new().unwrap_or_else(|| fail("must run on the main thread"));
+    let _windows = black_out(mtm);
 
     // --- 4. Wait for the user to come back ---
-    unix::wait_for_activity(|| Some(seconds_since_input()));
-    log!("Welcome back - releasing the no-sleep assertion.");
-    let _ = caffeinate.kill();
-    let _ = caffeinate.wait();
+    // AppKit needs the main thread to keep the windows up, so the waiting
+    // happens on another one, which also ends the process.
+    thread::spawn(move || {
+        unix::wait_for_activity(|| Some(seconds_since_input()));
+        log!("Welcome back - releasing the no-sleep assertion.");
+        let _ = caffeinate.kill();
+        let _ = caffeinate.wait();
+        log!("Done. Exiting.");
+        std::process::exit(0);
+    });
+    NSApplication::sharedApplication(mtm).run();
 }
