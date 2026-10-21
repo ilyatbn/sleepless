@@ -233,6 +233,50 @@ Driving a prompt-driven CLI command without a GUI:
   `io::Result` and is logged.
 - Cap test runs: `timeout 60 cargo test`; bisect a hang with `cargo test <name>`.
 
+### "First responder" is not "the keyboard"
+
+A field in a window of an **inactive** app is still its window's first responder,
+and `makeFirstResponder:` returns YES - but the keystrokes go to whichever app is
+frontmost. On a developer's machine that is usually Terminal, so a password box
+there types the password into a shell, and Return runs it and keeps it in the
+history. The only evidence worth trusting is `-[NSApplication isActive]`:
+
+* ask for activation, **pump briefly**, then read `isActive` (activation is
+  asynchronous, so reading it immediately says nothing);
+* one follow-up request is reasonable, a poll loop is not (it makes the key window
+  flap and steals focus from the user's app);
+* while it is false, say so in the UI - "Click this screen to type your password".
+  A click on your own window always activates your app; cooperative activation
+  cannot decline that;
+* log `isActive` transitions, and check it after the screen goes black too: the
+  keypress that wakes the display goes to the frontmost app as well;
+* don't ask the system for biometrics while inactive - the panel may never appear
+  and the wait is only bounded, not short.
+
+### AppKit counts hide/show
+
+`NSCursor::hide` and `unhide` are counted; an unbalanced sequence leaves the
+pointer wrong for the rest of the session. Model it as a pure transition -
+`(hidden, want_hide) -> (new_state, act)` - and test both directions plus a
+repeated sequence. The bug this catches: `if !flag.swap(true) { return; }` returns
+on the **first** call, so the pointer was never hidden at all.
+
+### Never `thread::sleep` on the main thread of a GUI process
+
+Sleeping through a lock-out penalty freezes drawing and input, and it also stops
+the run loop - so a distributed `com.apple.screenIsLocked` notification, which is
+delivered by `performSelectorOnMainThread:`, is not processed: Ctrl+Cmd+Q appears
+to do nothing for 16 seconds. Share the *policy* (how long) with the platform and
+let the platform do the *waiting* (pump), and pass the reason for the pause
+(`Penalty` vs `Brief`) so the UI can announce the right one.
+
+### A dismissed prompt is not a wrong guess
+
+Counting Escape (or a cancelled dialog) as a failed guess builds a penalty the
+user then pays for typing the correct password. Return `Dismissed` separately from
+`Guess(Secret)`; still take a fixed short breath on dismissal so a prompt that
+can't be answered at all (no askpass, wedged dialog) can't spin the loop.
+
 ### The presenter rule (learned the hard way, three betas deep)
 
 Show UI only from a process the system is willing to activate.

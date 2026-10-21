@@ -1073,6 +1073,112 @@ Log lines worth sending back (`~/Library/Logs/Sleepless/sleepless.log`, run with
 - Any `Objective-C exception thrown:` or `PANIC at` line.
 
 
+## beta7: the four findings from an independent review of the beta6 design
+
+The design (enrolment in the tray app, the box inside the black window) stood up
+to the review; four real defects were found in it, all fixed here.
+
+### 1. SERIOUS — the keystrokes could go to another app
+
+`show_password_box` makes the window key and the field the first responder, and
+then this process asks for activation once. Under cooperative activation
+(macOS 14+) that request can be **declined**. The field is still "first responder"
+of its window - and the log line said so - but the window belongs to an inactive
+app, so everything typed goes to whatever app *is* frontmost. For anyone testing
+this from Terminal, that means the password is typed into a shell prompt, and
+Return runs it as a command and keeps it in the shell's history.
+
+What the code does now:
+
+- `app_is_active(mtm)` (`-[NSApplication isActive]`) is the only accepted evidence
+  that input can arrive. `field is first responder: true` is kept in the log but
+  is no longer treated as enough.
+- `activate_and_wait` requests activation, pumps for up to 600ms (activation is
+  asynchronous), and if the app is still not active requests **once** more - then
+  stops: a poll loop is what made beta5's key window flap.
+- While the app is not active, the box says `Click this screen to type your
+  password` and the prompt message is not painted over it. A click on one of our
+  own windows always activates our app; cooperative activation cannot decline
+  that. `wait_for_box` re-checks `isActive` every pump slice (≤40ms), logs the
+  transition (`The keyboard belongs to Sleepless again.` / `The keyboard does NOT
+  belong to Sleepless: anything typed goes to another app.`), and on the way back
+  in, re-focuses the field and restores the question.
+- The same request/check happens right after black-out, so the session is the
+  active app before the user ever comes back - the keypress that wakes the
+  display goes to the frontmost app too, and it shouldn't be a shell. Logged as
+  `Black screen: this app is the one the keyboard belongs to: true|false.`
+- Touch ID is **skipped** while the keyboard isn't ours: Apple's panel may never
+  appear for an inactive app, and the wait for it is bounded at 45s - the user
+  would stare at "click this screen" for 45 seconds instead of clicking.
+- The tray app's dialogs log the same fact (`activation requested; this app is the
+  active app: true`), so an enrolment dialog that can't be typed into is visible
+  in the log.
+
+### 2. The pointer counter was inverted, so the pointer was never hidden
+
+`hide_cursor` guarded with `if !CURSOR_HIDDEN.swap(true) { return }`: on the
+first call the previous value is `false`, so it returned **without hiding**, and
+every black screen in every beta so far has had a visible pointer. `show_cursor`
+had the mirror bug. The transition is now a pure function -
+`cursor_action(hidden, want_hide) -> (new state, act)` - with both directions and
+a walk over a repeated sequence pinned by a test (`the_pointer_counter_acts_once_per_change`),
+because AppKit counts these calls and an unbalanced pair leaves the pointer wrong
+for the whole session.
+
+### 3. The back-off penalty slept on the main thread
+
+`lock::unlock_loop` called `std::thread::sleep` for a penalty of up to 16s. On
+macOS that happens on the main thread, so for the whole penalty: no drawing, no
+keyboard, and no `com.apple.screenIsLocked` - which is delivered on the main run
+loop - so Ctrl+Cmd+Q did nothing until the penalty expired. That is precisely the
+escape hatch failing when it is most needed.
+
+- `unlock_loop_with_wait` hands the pause to the platform instead, and the pause
+  says *why*: `Pause::Penalty(Duration)` (worth announcing) or `Pause::Brief`
+  (a breath so a prompt that can't be answered can't spin the loop). Windows and
+  Linux keep `unlock_loop`, which sleeps both.
+- macOS waits penalties out with `wait_pumped`: pumping AppKit, aborting if the
+  session is taken over, and counting the remaining seconds down in the box
+  (`Too many attempts - wait 8s`).
+- Escape and other dismissals are no longer guesses. `ask` returns
+  `lock::Ask::{Guess, Dismissed}`; only `Guess` reaches `check_password` and feeds
+  the back-off. Mashing Escape used to build up the penalty the next honest
+  attempt then paid for. Three tests pin this: `dismissing_the_prompt_costs_no_back_off`,
+  `wrong_guesses_hand_the_back_off_to_the_platform`, `a_cut_short_wait_ends_the_gate`.
+
+### 4. The Escape notice was overwritten the instant it was shown
+
+`unlock_loop` reset the message and the next `ask` called `set_box_status` with
+it, so "Escape does not unlock Sleepless" was painted over immediately. The
+Escape notice now sets a flag and writes only the status line; the gate's next
+pass leaves it standing for that round.
+
+### Found while re-reviewing these fixes
+
+| Finding | Fix |
+|---|---|
+| The rejected guess sat in the box through the whole penalty - visible over the user's shoulder, and in the way of the next attempt (`set_box_status` cleared it only when the next round started) | the Return handler clears the box as soon as the value is committed; the next round puts the caret back |
+| `activate_and_wait` waited 600ms for activation *before* requesting it on the gate path | requests, waits, then requests once more |
+| A dismissed prompt must not spin the loop, but must not look like a penalty either | `Pause::Brief`, pumped on macOS without a countdown message |
+
+### Audit additions
+
+| selector | class | verified against | ok |
+|---|---|---|---|
+| `-isActive` | NSApplication | objc2-app-kit `NSApplication.rs` (`pub fn isActive(&self) -> bool`) | ✓ |
+| `-validateEditing` | NSControl | `NSControl.rs:442` | ✓ |
+| `-abortEditing` | NSControl | `NSControl.rs:438` `-> bool` | ✓ |
+| `-makeFirstResponder:` | NSWindow | `NSWindow.rs:952` `Option<&NSResponder> -> bool` | ✓ |
+
+### Verification for beta7
+
+`cargo check --tests --workspace` clean (0 warnings) for linux, windows-gnu, both
+darwin targets, and the `catch-objc-exceptions` build; `timeout 60 cargo test
+--workspace` → 21 passed (+3 gate tests), 1 ignored, +1 gui. The two
+macOS-only tests (`the_password_box_follows_the_pointer`,
+`the_pointer_counter_acts_once_per_change`) run on the workflow's macOS leg.
+
+
 ## Sources
 
 - https://learn.microsoft.com/windows/win32/api/winreg/nf-winreg-regcreatekeyexw

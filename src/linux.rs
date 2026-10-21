@@ -408,7 +408,7 @@ pub fn run(opts: crate::Options) {
 fn unlock_gate() {
     log!("A password is enrolled: asking before restoring the power settings.");
     if lock::unlock_loop(
-        |message| prompt_secret("Sleepless", message),
+        |message| Ask::from_prompt(prompt_secret("Sleepless", message)),
         session_was_taken,
     ) {
         log!("Password accepted - restoring the power settings.");
@@ -425,7 +425,7 @@ fn unlock_gate() {
 // GUI library dependencies, same as everywhere else in this backend.
 // ---------------------------------------------------------------------
 
-use crate::lock::{self, Secret};
+use crate::lock::{self, Ask, Secret};
 use std::io::{self, Write};
 use std::process::Command;
 

@@ -21,7 +21,7 @@
 // Action (right-click > Quick Actions > "Sleepless as root") into
 // ~/Library/Services.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::path::Path;
 use std::process::Child;
@@ -179,10 +179,16 @@ fn black_out(mtm: MainThreadMarker) -> Vec<Retained<SleeplessBlackWindow>> {
     log!("Blacked out {} display(s).", windows.len());
     log!("Bringing the app forward and hiding the pointer.");
     // Guarded because a failure here must not take the black windows with it.
+    // Activation is a request since macOS 14, so ask and then *check*: the
+    // keypress that wakes the display goes to the frontmost app, and if that
+    // isn't us, the password typed a moment later is a shell command in someone
+    // else's window. The log records which way it went.
     let outcome = unsafe { try_objc(|| activate_app(&app)) };
     if let Err(why) = outcome {
         log!("Activating the app failed: {why} - continuing anyway.");
     }
+    let settled = wait_for_active(mtm, Duration::from_millis(400));
+    log!("Black screen: this app is the one the keyboard belongs to: {settled}.");
     let outcome = unsafe { try_objc(|| hide_cursor()) };
     if let Err(why) = outcome {
         log!("Hiding the pointer failed: {why} - continuing anyway.");
@@ -388,8 +394,19 @@ struct GateBox {
 thread_local! {
     static GATE_BOX: RefCell<Option<GateBox>> = const { RefCell::new(None) };
     // What the last key press did: filled in by the event monitor, taken by
-    // `wait_for_submit`. `Entered` carries what was typed.
+    // `wait_for_box`. `Entered` carries what was typed.
     static GATE_KEY: RefCell<GateKey> = const { RefCell::new(GateKey::Nothing) };
+    /// The question the gate is asking, so that becoming active again can put the
+    /// same words back where they were.
+    static GATE_MESSAGE: RefCell<String> = const { RefCell::new(String::new()) };
+    /// Set while this app is *not* the active one: the status line tells the user
+    /// to click, and nothing overwrites it until the click arrives.
+    static GATE_NEEDS_CLICK: Cell<bool> = const { Cell::new(false) };
+    /// Set by Escape: its notice stays up for the round that follows instead of
+    /// being painted over by the next prompt.
+    static GATE_ESCAPE_NOTICE: Cell<bool> = const { Cell::new(false) };
+    /// The app's active state as last seen, so a change is logged once.
+    static GATE_ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
 
 enum GateKey {
@@ -518,7 +535,17 @@ fn show_password_box(mtm: MainThreadMarker, windows: &[Retained<SleeplessBlackWi
                                         // and unlike resigning first responder it
                                         // leaves the caret in the box.
                                         held.field.validateEditing();
-                                        held.field.stringValue().to_string()
+                                        let submitted = held.field.stringValue().to_string();
+                                        // Take the submitted text out of the box
+                                        // straight away, and let the next round
+                                        // put the caret back. Otherwise the last
+                                        // guess sits there through the whole
+                                        // back-off wait - visible to anyone
+                                        // looking over the shoulder, and in the
+                                        // way of the next attempt.
+                                        held.window.makeFirstResponder(None);
+                                        held.field.setStringValue(&NSString::new());
+                                        submitted
                                     })
                                     .unwrap_or_default()
                             });
@@ -607,9 +634,10 @@ fn make_label(text: &NSString, size: f64) -> Retained<NSTextField> {
 
 /// What the box says right now, and a clean field to type the next attempt into.
 fn set_box_status(message: &str) {
+    GATE_MESSAGE.with(|held| *held.borrow_mut() = message.to_string());
+    set_status_line(message);
     GATE_BOX.with(|slot| {
         if let Some(held) = slot.borrow().as_ref() {
-            held.status.setStringValue(&NSString::from_str(message));
             // Never leave the attempt that just failed sitting in the box: the
             // in-progress edit goes away first, then the cell's value.
             held.field.abortEditing();
@@ -623,37 +651,170 @@ fn set_box_status(message: &str) {
     });
 }
 
+/// Only the line under the field: for notices that must not disturb the box.
+fn set_status_line(message: &str) {
+    GATE_BOX.with(|slot| {
+        if let Some(held) = slot.borrow().as_ref() {
+            held.status.setStringValue(&NSString::from_str(message));
+        }
+    });
+}
+
+/// Whether AppKit thinks this app is the active one.
+///
+/// This - not "the field is first responder" - is the evidence that keystrokes
+/// reach the box. A field in a window of an *inactive* app is still that window's
+/// first responder, and the typing goes to whoever is frontmost: on a developer's
+/// machine that is usually Terminal, which would run the password as a shell
+/// command and keep it in the history. So the gate never pretends to be
+/// answerable while this is false.
+fn app_is_active(mtm: MainThreadMarker) -> bool {
+    NSApplication::sharedApplication(mtm).isActive()
+}
+
+/// Waits briefly, pumping, for the system to make this app active.
+fn wait_for_active(mtm: MainThreadMarker, how_long: Duration) -> bool {
+    let until = Instant::now() + how_long;
+    loop {
+        if app_is_active(mtm) {
+            note_active(mtm, true);
+            return true;
+        }
+        if Instant::now() >= until || session_was_taken() || !pump_slice(mtm) {
+            note_active(mtm, app_is_active(mtm));
+            return false;
+        }
+    }
+}
+
+/// Asks for activation, and asks **once** more if the first request was declined.
+/// Never in a poll loop: cooperative activation is a request, and beta5 asked
+/// twice a second, which made the key window flap and pulled focus away from the
+/// user's terminal every other tick.
+fn activate_and_wait(mtm: MainThreadMarker, what: &str) -> bool {
+    let app = NSApplication::sharedApplication(mtm);
+    let asked = unsafe { try_objc(|| activate_app(&app)) };
+    if let Err(why) = asked {
+        log!("{what}: the activation request threw: {why}");
+    }
+    if wait_for_active(mtm, Duration::from_millis(600)) {
+        return true;
+    }
+    log!("{what}: not the active app yet - asking once more.");
+    let outcome = unsafe { try_objc(|| activate_app(&app)) };
+    if let Err(why) = outcome {
+        log!("{what}: the second activation request threw: {why}");
+        return false;
+    }
+    let active = wait_for_active(mtm, Duration::from_millis(600));
+    log!("{what}: active after the second request: {active}.");
+    active
+}
+
+/// Records a change in "does the keyboard belong to us" and puts up, or takes
+/// down, the affordance that goes with it.
+///
+/// A click on one of our own windows always activates our app - the one path
+/// cooperative activation cannot decline - so while the app is inactive the box
+/// says to click, and the moment it is active again the field takes the focus and
+/// the question comes back.
+fn note_active(mtm: MainThreadMarker, active: bool) {
+    let _ = mtm;
+    let was = GATE_ACTIVE.with(|slot| slot.replace(active));
+    if was == active {
+        return;
+    }
+    if active {
+        log!("The keyboard belongs to Sleepless again.");
+        if GATE_NEEDS_CLICK.with(|slot| slot.replace(false)) {
+            GATE_BOX.with(|slot| {
+                if let Some(held) = slot.borrow().as_ref() {
+                    held.window.makeKeyAndOrderFront(None);
+                    let _ = held.window.makeFirstResponder(Some(&held.field));
+                }
+            });
+            let message = GATE_MESSAGE.with(|held| held.borrow().clone());
+            set_box_status(&message);
+        }
+    } else {
+        log!(
+            "The keyboard does NOT belong to Sleepless: anything typed goes to              another app."
+        );
+        GATE_NEEDS_CLICK.with(|slot| slot.set(true));
+        set_status_line("Click this screen to type your password");
+    }
+}
+
+/// The back-off penalty, waited out with AppKit running.
+///
+/// Sleeping here would freeze the main thread for up to sixteen seconds: no
+/// drawing, no keyboard, and - because `com.apple.screenIsLocked` is delivered on
+/// the main run loop - no Ctrl+Cmd+Q either, so the OS lock would not be noticed
+/// until the penalty expired. This pumps instead, and the countdown is the status
+/// line. False means the session was taken over during the wait.
+fn wait_pumped(mtm: MainThreadMarker, how_long: Duration, announce: bool) -> bool {
+    let until = Instant::now() + how_long;
+    let mut shown = u64::MAX;
+    loop {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.as_millis() == 0 {
+            return true;
+        }
+        let secs = left.as_secs() + u64::from(left.subsec_millis() > 0);
+        if announce && secs != shown {
+            shown = secs;
+            set_status_line(&format!("Too many attempts - wait {secs}s"));
+        }
+        if !pump_slice(mtm) {
+            log!("Waiting out the penalty: AppKit stopped answering.");
+            release_and_exit();
+        }
+        if session_was_taken() {
+            return false;
+        }
+    }
+}
+
 /// Waits for the user to press Return (or Escape) in the box, pumping AppKit's
 /// queue meanwhile so the field editor works. There's no timeout on purpose:
 /// standing in front of a locked screen is allowed. The session being taken over
 /// by the OS ends the wait.
-fn wait_for_box(mtm: MainThreadMarker) -> Option<Secret> {
+fn wait_for_box(mtm: MainThreadMarker) -> lock::Ask {
     GATE_KEY.with(|key| *key.borrow_mut() = GateKey::Nothing);
     let started = Instant::now();
     let mut last_breadcrumb = started;
     loop {
         // Keeps the field editor alive: this is what delivers the keystrokes.
         if !pump_slice(mtm) {
-            log!("Password box: AppKit stopped answering; the box is giving up.");
-            return None;
+            // A box that cannot hear anything is not a lock screen: hand the
+            // display back rather than hold a screen nobody can answer.
+            log!("Password box: AppKit stopped answering; ending the session.");
+            release_and_exit();
         }
+        // The one fact that decides whether typing here reaches the box.
+        note_active(mtm, app_is_active(mtm));
 
         let pressed = GATE_KEY.with(|key| {
             let mut slot = key.borrow_mut();
             core::mem::replace(&mut *slot, GateKey::Nothing)
         });
         match pressed {
-            GateKey::Entered(text) => return Some(text),
+            GateKey::Entered(text) => return lock::Ask::Guess(text),
             GateKey::Escaped => {
+                // Escape is not a guess, so it costs no back-off, and it never
+                // unlocks. The notice is written on the status line only, and
+                // flagged, so the gate's next pass leaves it standing instead of
+                // painting the prompt back over it.
                 log!("Password box: Escape pressed; that clears the box and does not unlock.");
-                set_box_status("Escape does not unlock Sleepless");
-                return None;
+                GATE_ESCAPE_NOTICE.with(|slot| slot.set(true));
+                set_status_line("Escape does not unlock Sleepless");
+                return lock::Ask::Dismissed;
             }
             GateKey::Nothing => {}
         }
         if session_was_taken() {
             log!("Password box: the session was taken over while waiting.");
-            return None;
+            return lock::Ask::Dismissed;
         }
 
         // Someone standing in front of a locked screen is allowed to take their
@@ -664,14 +825,15 @@ fn wait_for_box(mtm: MainThreadMarker) -> Option<Secret> {
         if now - last_breadcrumb >= Duration::from_secs(20) {
             last_breadcrumb = now;
             log!(
-                "Password box: still waiting for a password after {}s (window key: {}).",
+                "Password box: still waiting for a password after {}s (window key: {},                  keyboard is ours: {});",
                 (now - started).as_secs(),
                 GATE_BOX.with(|slot| {
                     slot.borrow()
                         .as_ref()
                         .map(|held| held.window.isKeyWindow())
                         .unwrap_or(false)
-                })
+                }),
+                app_is_active(mtm)
             );
         }
     }
@@ -783,8 +945,27 @@ fn pump_events_until(mtm: MainThreadMarker, stop: impl Fn() -> bool) {
 
 static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
 
+/// Whether a hide/show request should actually act, given the state the pointer
+/// is thought to be in - and the state it ends up in. AppKit **counts** these
+/// calls, so acting twice in one direction leaves the pointer wrong for the rest
+/// of the session. The bug this replaces: the guard was the wrong way round, so
+/// the first `hide_cursor` returned without hiding and no black screen ever
+/// hid the pointer.
+///
+/// (`hidden`, `want_hide`) -> `(new state, act)`
+fn cursor_action(hidden: bool, want_hide: bool) -> (bool, bool) {
+    match (hidden, want_hide) {
+        (true, true) => (true, false),    // already hidden
+        (false, true) => (true, true),    // hide now
+        (false, false) => (false, false), // already visible
+        (true, false) => (false, true),   // show again
+    }
+}
+
 fn hide_cursor() {
-    if !CURSOR_HIDDEN.swap(true, Ordering::SeqCst) {
+    let (hidden, act) = cursor_action(CURSOR_HIDDEN.load(Ordering::SeqCst), true);
+    CURSOR_HIDDEN.store(hidden, Ordering::SeqCst);
+    if !act {
         return;
     }
     log!("Hiding the pointer.");
@@ -792,7 +973,9 @@ fn hide_cursor() {
 }
 
 fn show_cursor() {
-    if !CURSOR_HIDDEN.swap(false, Ordering::SeqCst) {
+    let (hidden, act) = cursor_action(CURSOR_HIDDEN.load(Ordering::SeqCst), false);
+    CURSOR_HIDDEN.store(hidden, Ordering::SeqCst);
+    if !act {
         return;
     }
     log!("Showing the pointer again.");
@@ -1449,26 +1632,56 @@ pub fn run(opts: crate::Options) {
     if GATE_ARMED.load(Ordering::SeqCst) {
         // The box goes up first, so a Touch ID attempt happens with our window
         // already key: if the sensor can't help, the field is simply still there
-        // and already focused.
+        // and already focused (and it is only attempted at all while this app owns
+        // the keyboard - see below).
         if !show_password_box(mtm, &_windows) {
             // Nothing to type into. Handing the screen back is better than
             // holding a black monitor nobody can answer.
             log!("No password box could be shown; ending the session rather than holding the screen.");
             release_and_exit();
         }
-        // One activation request, before anything is asked: without it the
-        // window is key but the app isn't active, and the keystrokes never
-        // arrive. (The session-lock path is what ends a run the system takes
-        // over, so no timer is needed to re-assert this.)
-        activate_app(&NSApplication::sharedApplication(mtm));
+        // Ask for the keyboard, then find out whether the system granted it. If
+        // it did not, the box says so in words: typing into an app that isn't
+        // active goes to whatever app is, and a password typed into a shell is a
+        // shell command that also ends up in the shell's history.
+        let mine = activate_and_wait(mtm, "Password box");
+        GATE_NEEDS_CLICK.with(|slot| slot.set(!mine));
+        if !mine {
+            set_status_line("Click this screen to type your password");
+        }
         show_cursor();
-        let unlocked = (lock::has_passkey() && passkey_unlock(mtm))
-            || lock::unlock_loop(
+        // Touch ID is only worth asking while the keyboard and the screen are
+        // ours: with the app inactive Apple's panel may never come up at all, and
+        // the wait for it is bounded but slow - the user would be staring at
+        // "click this screen" for 45 seconds. Clicking first costs nothing.
+        let touch_id_now = lock::has_passkey() && app_is_active(mtm);
+        if lock::has_passkey() && !touch_id_now {
+            log!(
+                "Not asking Touch ID while another app owns the keyboard; the password                  box is waiting for a click."
+            );
+        }
+        let unlocked = (touch_id_now && passkey_unlock(mtm))
+            || lock::unlock_loop_with_wait(
                 |message| {
-                    set_box_status(message);
+                    // The question is always remembered; it is only painted over
+                    // a notice the user still needs to see (click first, or the
+                    // Escape that just happened).
+                    GATE_MESSAGE.with(|held| *held.borrow_mut() = message.to_string());
+                    let notice_stands = GATE_NEEDS_CLICK.with(|slot| slot.get())
+                        || GATE_ESCAPE_NOTICE.with(|slot| slot.replace(false));
+                    if !notice_stands {
+                        set_box_status(message);
+                    }
                     wait_for_box(mtm)
                 },
                 session_was_taken,
+                |pause| match pause {
+                    // A penalty is announced in the box; the brief breath after
+                    // a dismissed prompt is not, or Escape's own notice would be
+                    // relabelled as a penalty it never was.
+                    lock::Pause::Penalty(how_long) => wait_pumped(mtm, how_long, true),
+                    lock::Pause::Brief(how_long) => wait_pumped(mtm, how_long, false),
+                },
             );
         hide_password_box();
         if !unlocked {
@@ -1523,5 +1736,34 @@ mod tests {
             pick_box_window(&[main, above], NSPoint::new(10.0, 1081.0)),
             1
         );
+    }
+
+    /// AppKit counts hide/show, so a request acts only when it would change the
+    /// state. The bug this pins: the guard was the wrong way round, so the first
+    /// `hide_cursor` returned without hiding, and the pointer stayed visible over
+    /// a black screen for the whole session.
+    #[test]
+    fn the_pointer_counter_acts_once_per_change() {
+        assert_eq!(cursor_action(false, true), (true, true)); // hide now
+        assert_eq!(cursor_action(true, true), (true, false)); // already hidden
+        assert_eq!(cursor_action(true, false), (false, true)); // show again
+        assert_eq!(cursor_action(false, false), (false, false)); // already shown
+
+        // Repeated requests in one direction stay balanced.
+        let mut hidden = false;
+        let (mut hides, mut shows) = (0, 0);
+        for want_hide in [true, true, false, false, true, false, true, true, false] {
+            let (next, act) = cursor_action(hidden, want_hide);
+            hidden = next;
+            if act {
+                if want_hide {
+                    hides += 1;
+                } else {
+                    shows += 1;
+                }
+            }
+        }
+        assert_eq!((hides, shows), (4, 3));
+        assert!(hidden, "nine requests, ending hidden by one");
     }
 }

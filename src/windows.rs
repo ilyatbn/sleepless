@@ -269,7 +269,7 @@ fn screensaver_is_running() -> bool {
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::lock::{self, Secret};
+use crate::lock::{self, Ask, Secret};
 use crate::store;
 use windows_sys::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
@@ -1281,7 +1281,7 @@ pub fn run(opts: crate::Options) {
         match overlay {
             Some(overlay) => {
                 let unlocked = lock::unlock_loop(
-                    |message| unsafe { lock_overlay_ask(overlay, message) },
+                    |message| Ask::from_prompt(unsafe { lock_overlay_ask(overlay, message) }),
                     session_was_taken,
                 );
                 unsafe { lock_overlay_free(overlay) };
@@ -1297,7 +1297,7 @@ pub fn run(opts: crate::Options) {
             None => {
                 log!("No lock screen window; asking through the password dialog instead.");
                 let unlocked = lock::unlock_loop(
-                    |message| prompt_secret("Sleepless", message),
+                    |message| Ask::from_prompt(prompt_secret("Sleepless", message)),
                     session_was_taken,
                 );
                 if unlocked {

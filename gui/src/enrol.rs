@@ -80,6 +80,14 @@ mod imp {
         if app.respondsToSelector(sel!(activate)) {
             app.activate();
         }
+        // Not a promise: activation is a request since macOS 14. The dialog is
+        // still drawn either way, and clicking it always activates this app -
+        // but a secure field the user can't type in is the failure this whole
+        // design is trying to avoid, so record whether it went our way.
+        log::note(&format!(
+            "activation requested; this app is the active app: {}",
+            app.isActive()
+        ));
     }
 
     /// A password held briefly in this process and overwritten on the way out.

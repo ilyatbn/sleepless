@@ -254,9 +254,67 @@ impl Backoff {
 /// `false`: the OS taking the session over (its own lock screen, a fast user
 /// switch) has to be able to interrupt a gate whose prompt is wedged. Returns
 /// whether the password was accepted.
-pub fn unlock_loop(
-    mut ask: impl FnMut(&str) -> Option<Secret>,
+/// What the prompt came back with.
+pub enum Ask {
+    /// Something was submitted - possibly nothing at all. This is a guess: it is
+    /// checked, and a wrong one feeds the back-off.
+    Guess(Secret),
+    /// The prompt was cleared or abandoned (Escape, a cancelled dialog). Never a
+    /// way through, and deliberately not a guess either: mashing Escape must not
+    /// build up a penalty the user then pays for typing the right password.
+    Dismissed,
+}
+
+impl Ask {
+    /// Adapter for the prompts that answer with an `Option` - the Windows dialog
+    /// and the Linux askpass. Whatever came back, even an empty string, was
+    /// submitted; only "no answer at all" is a dismissal. (The macOS box says
+    /// which key was pressed instead, so it doesn't need this.)
+    #[cfg(any(windows, target_os = "linux"))]
+    pub fn from_prompt(answer: Option<Secret>) -> Ask {
+        match answer {
+            Some(secret) => Ask::Guess(secret),
+            None => Ask::Dismissed,
+        }
+    }
+}
+
+/// Why the gate is pausing, so a platform with a screen can tell the two apart:
+/// a back-off penalty is worth announcing, a short breath after a dismissed
+/// prompt is not - and labelling one as the other tells the user they've been
+/// guessing when they haven't.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Pause {
+    /// The user has guessed wrong too often; this long, and worth showing.
+    Penalty(std::time::Duration),
+    /// A brief breath so that a prompt which can't be answered (no askpass, a
+    /// wedged dialog) can't spin the loop at full speed. Not a penalty.
+    Brief(std::time::Duration),
+}
+
+/// The gate, with the platform's own prompt and the platform's own sleep.
+pub fn unlock_loop(ask: impl FnMut(&str) -> Ask, cancelled: impl FnMut() -> bool) -> bool {
+    unlock_loop_with_wait(ask, cancelled, |pause| {
+        let how_long = match pause {
+            Pause::Penalty(how_long) | Pause::Brief(how_long) => how_long,
+        };
+        std::thread::sleep(how_long);
+        true
+    })
+}
+
+/// The gate, with the wait handed to the caller.
+///
+/// `wait` sleeps out a pause and returns false if it was cut short because the
+/// session was taken over. A prompt that lives on the **main thread** must not
+/// sleep there: on macOS that freezes AppKit for the whole penalty - no drawing,
+/// no keyboard input, and no `com.apple.screenIsLocked` notification, which is
+/// delivered on the main run loop - so the OS lock would not be noticed until the
+/// penalty ran out. Those platforms pass a pumping wait instead.
+pub fn unlock_loop_with_wait(
+    mut ask: impl FnMut(&str) -> Ask,
     mut cancelled: impl FnMut() -> bool,
+    mut wait: impl FnMut(Pause) -> bool,
 ) -> bool {
     let mut backoff = Backoff::default();
     let mut message = "Enter your password to come back";
@@ -283,11 +341,17 @@ pub fn unlock_loop(
             return false;
         }
         match ask(message) {
-            Some(secret) => {
-                let wait = backoff.penalty();
-                if !wait.is_zero() {
-                    log!("Too many guesses: waiting {wait:?} before the next attempt.");
-                    std::thread::sleep(wait);
+            Ask::Guess(secret) => {
+                let penalty = backoff.penalty();
+                if !penalty.is_zero() {
+                    log!("Too many guesses: waiting {penalty:?} before the next attempt.");
+                    if !wait(Pause::Penalty(penalty)) {
+                        log!(
+                            "Session taken over during the back-off wait: ending the gate                              ({} attempt(s) so far).",
+                            backoff.attempts()
+                        );
+                        return false;
+                    }
                 }
                 if check_password(&secret) {
                     log!(
@@ -299,11 +363,15 @@ pub fn unlock_loop(
                 backoff.failure();
                 message = "Wrong password, try again";
             }
-            None => {
-                // Dismissed rather than answered: count it, and pause a moment
-                // so a held-down Enter can't spin the loop.
-                backoff.failure();
-                std::thread::sleep(std::time::Duration::from_millis(400));
+            Ask::Dismissed => {
+                // Not a guess, so no back-off - but a fixed short pause, so a
+                // prompt that can't be answered (no askpass, a wedged dialog)
+                // can't spin the loop at full speed.
+                log!("The prompt was dismissed; not counted as a guess.");
+                if !wait(Pause::Brief(std::time::Duration::from_millis(400))) {
+                    log!("Session taken over while the prompt was dismissed.");
+                    return false;
+                }
                 message = "Enter your password to come back";
             }
         }
@@ -498,16 +566,16 @@ mod tests {
         enroll_cheaply("letmein");
 
         let mut answers = [
-            Some(Secret::new("wrong")),
-            Some(Secret::new("letmein")),
-            Some(Secret::new("never asked")),
+            Ask::Guess(Secret::new("wrong")),
+            Ask::Guess(Secret::new("letmein")),
+            Ask::Guess(Secret::new("never asked")),
         ]
         .into_iter();
         let mut messages = Vec::new();
         assert!(unlock_loop(
             |message| {
                 messages.push(message.to_string());
-                answers.next().flatten()
+                answers.next().unwrap()
             },
             || false,
         ));
@@ -527,7 +595,7 @@ mod tests {
         let unlocked = unlock_loop(
             |_| {
                 asked.set(asked.get() + 1);
-                Some(Secret::new("anything"))
+                Ask::Guess(Secret::new("anything"))
             },
             || false,
         );
@@ -548,7 +616,7 @@ mod tests {
         let unlocked = unlock_loop(
             |_| {
                 asked.set(asked.get() + 1);
-                Some(Secret::new("wrong on purpose"))
+                Ask::Guess(Secret::new("wrong on purpose"))
             },
             || asked.get() >= 2,
         );
@@ -561,16 +629,112 @@ mod tests {
         let _store = TempStore::new("unlockdismiss");
         enroll_cheaply("letmein");
 
-        let mut answers = [None, Some(Secret::new("letmein"))].into_iter();
+        let mut answers = [Ask::Dismissed, Ask::Guess(Secret::new("letmein"))].into_iter();
         let mut asked = 0;
         assert!(unlock_loop(
             |_| {
                 asked += 1;
-                answers.next().flatten()
+                answers.next().unwrap()
             },
             || false,
         ));
         assert_eq!(asked, 2);
+    }
+
+    /// Escape is not a guess, so it must never feed the back-off: someone
+    /// clearing the box a few times should not then pay 16 seconds to type the
+    /// right password. The pauses are the same fixed length, and none of them is
+    /// a penalty.
+    #[test]
+    fn dismissing_the_prompt_costs_no_back_off() {
+        let _store = TempStore::new("dismissbackoff");
+        enroll_cheaply("letmein");
+
+        let mut answers = [
+            Ask::Dismissed,
+            Ask::Dismissed,
+            Ask::Dismissed,
+            Ask::Guess(Secret::new("letmein")),
+        ]
+        .into_iter();
+        let mut pauses = Vec::new();
+        assert!(unlock_loop_with_wait(
+            |_| answers.next().unwrap(),
+            || false,
+            |pause| {
+                pauses.push(pause);
+                true
+            },
+        ));
+        assert_eq!(pauses.len(), 3, "three dismissals, three pauses");
+        assert!(
+            pauses
+                .iter()
+                .all(|p| *p == Pause::Brief(std::time::Duration::from_millis(400))),
+            "every one of them a flat breath, and not one a penalty: {pauses:?}"
+        );
+    }
+
+    /// A wrong guess is a guess, and the wait belongs to the platform: on macOS
+    /// the penalty has to be pumped (AppKit keeps drawing, the session-lock
+    /// notification still gets delivered), which is only possible if the loop
+    /// hands the duration out instead of sleeping on its own thread.
+    #[test]
+    fn wrong_guesses_hand_the_back_off_to_the_platform() {
+        let _store = TempStore::new("guessbackoff");
+        enroll_cheaply("letmein");
+
+        let mut answers = [
+            Ask::Guess(Secret::new("nope")),
+            Ask::Guess(Secret::new("nope again")),
+            Ask::Guess(Secret::new("letmein")),
+        ]
+        .into_iter();
+        let mut penalties = Vec::new();
+        assert!(unlock_loop_with_wait(
+            |_| answers.next().unwrap(),
+            || false,
+            |pause| {
+                penalties.push(pause);
+                true
+            },
+        ));
+        assert_eq!(
+            penalties,
+            vec![
+                Pause::Penalty(std::time::Duration::from_secs(1)),
+                Pause::Penalty(std::time::Duration::from_secs(2)),
+            ],
+            "the second and third guesses wait 1s and 2s, as penalties, handed              to the caller to wait out however its UI needs to"
+        );
+    }
+
+    /// A wait that reports the session was taken over ends the gate at once.
+    #[test]
+    fn a_cut_short_wait_ends_the_gate() {
+        let _store = TempStore::new("cutshort");
+        enroll_cheaply("letmein");
+
+        let mut answers = [
+            Ask::Guess(Secret::new("nope")),
+            Ask::Guess(Secret::new("nope")),
+            Ask::Guess(Secret::new("would never be asked")),
+        ]
+        .into_iter();
+        let mut asked = 0;
+        let unlocked = unlock_loop_with_wait(
+            |_| {
+                asked += 1;
+                answers.next().unwrap()
+            },
+            || false,
+            |_| false, // the platform says: cut short, the session is gone
+        );
+        assert!(
+            !unlocked,
+            "a gate whose penalty was cut short lets nobody in"
+        );
+        assert_eq!(asked, 2, "and it stops right there");
     }
 
     #[test]

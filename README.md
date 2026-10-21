@@ -111,14 +111,16 @@ answer itself:
 | Platform | What coming back looks like | Passkey |
 | --- | --- | --- |
 | Windows | A black window over every monitor goes up *before* the screensaver starts, so the keypress that ends the screensaver reveals that window instead of your desktop. Type the password, Enter. | not yet |
-| macOS | The black windows stay up, and the one under your pointer carries the password box: it is part of the black window itself, so it holds the keyboard (Tab-free - just type and press Return). The other displays stay plain black. | Touch ID is tried with the box already up; if the sensor can't help, the field is simply still there |
+| macOS | The black windows stay up, and the one under your pointer carries the password box: it is part of the black window itself, so it holds the keyboard (just type and press Return). The other displays stay plain black. Since macOS 14 the system decides which app may be frontmost, so if it didn't hand this one the keyboard, the box says **"Click this screen to type your password"** - until you click, typing would go to whatever app *is* active, and a password typed into a terminal is a shell command. Escape only clears the box. | Touch ID is tried with the box already up, and only while this app owns the keyboard; if the sensor can't help, the field is simply still there |
 | Linux | The display comes back first (the compositor decides when DPMS does), then an askpass dialog - or the terminal, if Sleepless was started from one. | none |
 
 The password is stored as a PBKDF2-HMAC-SHA256 hash with a random salt (600 000 rounds),
 never in the clear: `HKCU\Software\Sleepless\password` on Windows,
 `~/Library/Application Support/Sleepless/sleepless.conf` on macOS and
 `~/.config/sleepless/sleepless.conf` on Linux (written `0600`). Wrong answers cost
-progressively more time, and dismissing the prompt doesn't let you in.
+progressively more time - on macOS the box counts it down ("Too many attempts - wait
+8s") and stays responsive while it does, so locking the session still works. Clearing
+the prompt (Escape, Cancel) doesn't let you in and doesn't cost you anything either.
 
 **What it is and isn't.** It keeps whoever wanders up to your machine off a screen that
 Sleepless deliberately left unlocked - it is not a security boundary. It doesn't try to

@@ -1,6 +1,6 @@
 [package]
 name = "sleepless-gui"
-version = "0.2.2-beta.6"
+version = "0.2.2-beta.7"
 edition = "2021"
 
 [[bin]]
