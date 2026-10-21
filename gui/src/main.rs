@@ -200,7 +200,26 @@ fn run_cli(arg: &str) -> bool {
         "credential command: running {:?} {arg}",
         path.canonicalize().unwrap_or_else(|_| path.clone())
     ));
-    match Command::new(&path).arg(arg).output() {
+    // Spawned rather than `output()` so there is a pid in the hand: on macOS the
+    // child's dialog can only come to the front cleanly if this app - the one
+    // the user actually clicked in - yields activation to it first.
+    let started = Command::new(&path)
+        .arg(arg)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let child = match started {
+        Ok(child) => {
+            hand_over_activation(child.id());
+            child
+        }
+        Err(e) => {
+            log::note(&format!("could not run {}: {e}", path.display()));
+            eprintln!("Sleepless: could not run {}: {e}", path.display());
+            return false;
+        }
+    };
+    match child.wait_with_output() {
         Ok(out) => {
             for stream in [&out.stdout, &out.stderr] {
                 let text = String::from_utf8_lossy(stream).trim().to_string();
@@ -218,6 +237,50 @@ fn run_cli(arg: &str) -> bool {
         }
     }
 }
+
+/// macOS 14 turned activation into a request the system may decline unless the
+/// active app steps aside. The tray app is the one the user just clicked, so it
+/// asks - before the child has shown anything - that activation be yielded to
+/// the child process. Everything here is optional: a no-op on older macOS (the
+/// selector is guarded, since sending a method the system doesn't have throws),
+/// and a logged failure if the child isn't registered as an application yet.
+#[cfg(target_os = "macos")]
+fn hand_over_activation(pid: u32) {
+    use objc2_app_kit::{NSApplication, NSRunningApplication};
+    use objc2_foundation::NSObjectProtocol;
+
+    let Some(mtm) = objc2::MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    if !app.respondsToSelector(objc2::sel!(yieldActivationToApplication:)) {
+        log::note("this macOS has no yieldActivationToApplication:; activation is not handed over");
+        return;
+    }
+    // The child only appears as a running application once it has contacted the
+    // window server, which takes a moment after spawn. Bounded, and it is the
+    // tray's own menu that waits - already blocked on the child anyway.
+    for attempt in 0..10 {
+        let pid = i32::try_from(pid).unwrap_or(-1);
+        let Some(child) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) else {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            continue;
+        };
+        app.yieldActivationToApplication(&child);
+        log::note(&format!(
+            "yielded activation to pid {pid} ({}), attempt {}",
+            child.localizedName().unwrap_or_default(),
+            attempt + 1
+        ));
+        return;
+    }
+    log::note(&format!(
+        "pid {pid} is not a running application yet; activation not handed over"
+    ));
+}
+
+#[cfg(not(target_os = "macos"))]
+fn hand_over_activation(_pid: u32) {}
 
 /// True when coming back from the black screen needs a password. The CLI
 /// prints nothing; only its exit code matters here.

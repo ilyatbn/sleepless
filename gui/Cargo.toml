@@ -1,6 +1,6 @@
 [package]
 name = "sleepless-gui"
-version = "0.2.2-beta.5"
+version = "0.2.2-beta.6"
 edition = "2021"
 
 [[bin]]
@@ -35,8 +35,18 @@ x11rb = "0.13"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
+# NSObjectProtocol (respondsToSelector:) so the macOS-14-only message below can
+# be probed without a hand-written msg_send! signature.
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSObject",
+] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "NSApplication",
     "NSResponder",
+    # +runningApplicationWithProcessIdentifier: is behind the crate's "libc"
+    # feature (its argument is pid_t).
+    "NSRunningApplication",
+    "libc",
 ] }

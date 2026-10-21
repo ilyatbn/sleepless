@@ -728,6 +728,102 @@ After the 21 rows above were fixed, two more passes were run over the changed co
 - The Windows and Linux changes are compile-verified and code-reviewed only; the registry
   `RegDeleteValueW` path and the logind poller need the real machines.
 
+## beta6: the enrolment dialogs were invisible (2026-10-21)
+
+beta5 got the black screen back. The next report: "Set a password to come back" put a Dock
+icon up and showed no dialog anywhere, while stealing focus from Terminal; Escape eventually
+answered with `alert response 1001 -> not accepted`, and the `Cancelled:` alert *was* visible.
+The log had the frame on screen and the level right, and `key window` flipping true/false
+dozens of times across two minutes.
+
+### The mechanism
+
+Two things, both ours:
+
+1. **`NSAlert`'s window is an `NSPanel`, and `NSPanel` defaults to `hidesOnDeactivate = YES`.**
+   So every time the system deactivated us - which it does freely, because we are a
+   background process the user keeps tabbing away from - the dialog hid itself. That is
+   "on screen, right level, right frame, not visible".
+2. **`keep_prompt_on_top` asked for activation twice a second, using macOS 14's cooperative
+   `-activate`.** Cooperative activation is only a *request*: the system granted it, then
+   gave focus back to Terminal, then granted it again. The `key window: true/false` flap in
+   the log *is* that fight, and it is exactly the focus stealing the user reported. The timer
+   also ran for ordinary dialogs, where there is nothing to keep above anything.
+
+The policy flip to `Regular` in `show_modal` is where the unexpected Dock icon came from;
+beta3 didn't have it, and the same dialog was visible and typeable there.
+
+### What beta6 does
+
+- `setHidesOnDeactivate(false)` on every dialog window this app shows - and explicitly on
+  the black windows too, where the default happened to be the right one already. Without
+  this, "the screen went black and then came back" and "the dialog isn't there" are both one
+  flag away.
+- No activation-policy change for enrolment or any ordinary dialog: beta3's behaviour, no
+  Dock icon. `Regular` is used in exactly two places, each commented: the lock gate (a
+  non-active accessory app cannot own the key window, and at the gate the screen is ours
+  anyway) and the Touch ID prompt (Apple's panel needs an active app, and an accessory
+  process cannot become active).
+- The keep-on-top timer runs **only** for the lock gate (`show_modal(alert, mtm,
+  at_the_lock_screen)`). For every other dialog: activate once, show, and leave the user's
+  focus alone.
+- Inside the timer: if the box still has key, do nothing at all. Only when it lost key does
+  it re-raise and take key back, and re-activation is rate limited to once every two seconds
+  (and the counter starts so the first retry is two seconds in, after the single activation
+  in `show_modal` has had its chance).
+- `activate_app` asks once, three ways: the deprecated `activateIgnoringOtherApps:` (still
+  honoured before 14), `NSRunningApplication::currentApplication().activateWithOptions(
+  ActivateAllWindows)` (only that option - the `ActivateIgnoringOtherApps` *option* is
+  documented as having no effect since macOS 14), and 14's cooperative `-activate` if
+  `respondsToSelector:` says it's there.
+- The tray app, which is the app the user actually clicked, hands activation over to the
+  child before it blocks on it: `run_cli` now spawns and then
+  `yieldActivationToApplication:` for the child's pid (bounded 1 s search for the
+  `NSRunningApplication`, logged either way, skipped entirely on a macOS that doesn't have
+  the selector).
+- Diagnostics for the next report: `hidesOnDeactivate`, `isVisible`, `occlusionState` and
+  `NSApp.isActive` in the "Dialog … shown" line, and the same set from inside the modal loop
+  on the first timer tick.
+
+### Findings from reviewing this diff (second and third passes)
+
+| # | What | Fix |
+| --- | --- | --- |
+| 1 | Two of the new probes were hand-written `msg_send![…, respondsToSelector: …]` - the exact pattern that caused the last two crashes | replaced with the typed `NSObjectProtocol::respondsToSelector` (needs `objc2-foundation` in the tray crate); hand-written Objective-C messages in the whole branch are down to three, all in the table below |
+| 2 | `PROMPT_LAST_ACTIVATE` started at `u32::MAX - 10`, and `tick.saturating_sub(last)` on a small tick is 0 - the timer would never have re-activated a lost box | start at 0; first retry two seconds in |
+| 3 | The black windows relied on `NSWindow`'s default (not hiding on deactivate) while the dialogs needed the opposite; an easy thing to break later | `setHidesOnDeactivate(false)` spelled out on both |
+| 4 | `hand_over_activation` cast a `u32` pid to `i32` directly | `i32::try_from(pid).unwrap_or(-1)` |
+| 5 | `run_cli` used `.output()`, so there was no pid before the child ran | `spawn` + `wait_with_output`, which also keeps the existing stdout/stderr logging identical |
+| 6 | `activateWithOptions:` needed the crate's `libc` feature for `runningApplicationWithProcessIdentifier:` | feature recorded in `gui/Cargo.toml` with the reason |
+
+### Hand-written Objective-C after beta6 (the whole branch)
+
+| Selector | Receiver | Verified against | ok |
+| --- | --- | --- | --- |
+| `+defaultCenter` | NSDistributedNotificationCenter | Apple docs for the class (its only two class accessors) | yes |
+| `+new` | SleeplessLockWatcher (our `define_class!` subclass of NSObject) | NSObject `+new`; `msg_send!` converts the `id` result to `Retained` | yes |
+| `sleeplessSessionLockChanged:` | same class | declared in the same file by `#[unsafe(method(sleeplessSessionLockChanged:))]`; names match character for character | yes |
+
+Everything else, including `respondsToSelector:`, `activate`, `activateWithOptions:`,
+`yieldActivationToApplication:`, `setHidesOnDeactivate:`, `hidesOnDeactivate`,
+`occlusionState`, `isVisible`, `isActive`, `currentApplication`,
+`runningApplicationWithProcessIdentifier:`, `runModal`, `window`, the NSAlert/NSWindow/
+NSApplication/NSRunLoop/NSTimer set and the three LAContext methods, is a generated binding:
+the compiler resolves it against a signature taken from Apple's headers, so a wrong name or
+return type fails the build rather than crashing on someone's machine. That is the difference
+between a typed call and a hand-written `msg_send!`, and it is why the last three are the
+only ones left.
+
+### Still needs the machine
+
+- Whether one activation plus `hidesOnDeactivate = false` is enough for the enrolment dialog
+  to stay visible while the user works in Terminal - the new log line answers it.
+- Whether the tray's `yieldActivationToApplication:` finds the child at all (a bare CLI binary
+  may not appear as an `NSRunningApplication`); the log says which happened.
+- Whether the gate box still wins key against the black windows with the timer now idle when
+  key is held.
+- `occlusionState` semantics on the user's display setup.
+
 ## Sources
 
 - https://learn.microsoft.com/windows/win32/api/winreg/nf-winreg-regcreatekeyexw

@@ -33,9 +33,10 @@ use objc2::rc::Retained;
 use objc2::ClassType;
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSApplicationActivationPolicy,
-    NSBackingStoreType, NSColor, NSCursor, NSEvent, NSEventMask, NSModalResponse, NSScreen,
-    NSSecureTextField, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSApplicationActivationOptions,
+    NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSCursor, NSEvent, NSEventMask,
+    NSModalResponse, NSRunningApplication, NSScreen, NSSecureTextField, NSWindow,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::NSDefaultRunLoopMode;
 
@@ -156,6 +157,11 @@ fn black_out(mtm: MainThreadMarker) -> Vec<Retained<NSWindow>> {
                 )
             };
             unsafe { window.setReleasedWhenClosed(false) };
+            // Explicit, because the alternative is a "black screen" that
+            // disappears the moment another app becomes active: panels default
+            // to hiding on deactivate, and this is a plain window, but the
+            // enrolment dialog bug showed how much rests on this one flag.
+            window.setHidesOnDeactivate(false);
             window.setBackgroundColor(Some(&NSColor::blackColor()));
             window.setLevel(SCREEN_SAVER_WINDOW_LEVEL);
             window.setCollectionBehavior(
@@ -286,7 +292,8 @@ pub fn prompt_secret(title: &str, message: &str) -> Option<Secret> {
     log!("Showing the password dialog: {title} / {message}");
     // show_modal handles activation and the activation policy for us.
     let (alert, field) = secret_alert(mtm, title, message, true);
-    let answer = show_modal(&alert, mtm);
+    // Not the lock screen: no policy flip, no timer, no Dock icon.
+    let answer = show_modal(&alert, mtm, false);
     secret_from(&field, answer, "password dialog")
 }
 
@@ -308,26 +315,45 @@ fn prompt_secret_locked(title: &str, message: &str) -> Option<Secret> {
     // anywhere" was helped by there being no cursor to see either.
     show_cursor();
     let (alert, field) = secret_alert(mtm, title, message, false);
-    let answer = show_modal(&alert, mtm);
+    let answer = show_modal(&alert, mtm, true);
     // Back to black between attempts.
     hide_cursor();
     secret_from(&field, answer, "lock screen prompt")
 }
 
-/// Brings this process to the front.
+/// Asks once for this process to become the active app.
 ///
-/// `-activateIgnoringOtherApps:` is deprecated and, since macOS 14, a
-/// background process calling it is often just ignored; `-activate` is the new
-/// one but only exists on macOS 14+. So both, the second behind a
-/// `respondsToSelector:` check - and neither is trusted, since the timer below
-/// keeps trying while the dialog is up.
+/// Three ways, because macOS 14 changed the rules and we still run on older
+/// ones: the deprecated forceful call (honoured before 14), the
+/// `NSRunningApplication` one (with `ActivateAllWindows` only - the
+/// `ActivateIgnoringOtherApps` *option* is documented as having no effect since
+/// 14), and 14's cooperative `-activate`, which exists only there and so is
+/// behind `respondsToSelector:` (calling a method the system doesn't have is an
+/// unrecognized-selector exception, and that cost two betas already).
+///
+/// It must be called *once*, before entering the modal loop. beta5 called it
+/// twice a second from the keep-on-top timer: cooperative activation is only a
+/// request, the system granted and withdrew it in turn, and the enrolment dialog
+/// spent two minutes flickering between visible and hidden while stealing focus
+/// from Terminal - `key window: true/false` flipping every tick in the log is
+/// exactly that fight.
 fn activate_app(app: &NSApplication) {
     #[allow(deprecated)] // the pre-14 way; still accepted there
     app.activateIgnoringOtherApps(true);
-    let responds: Bool = unsafe { msg_send![app, respondsToSelector: sel!(activate)] };
-    if responds.as_bool() {
+    let me = NSRunningApplication::currentApplication();
+    let forced = me.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
+    // Typed (NSObjectProtocol), so there is no hand-written signature here.
+    let responds = app.respondsToSelector(sel!(activate));
+    let cooperated = if responds {
         app.activate();
-    }
+        true
+    } else {
+        false
+    };
+    log!(
+        "Asking for activation once (ignoringOtherApps, activateWithOptions -> {forced}, \
+         cooperative activate available: {cooperated})."
+    );
 }
 
 /// Shows an alert modally and keeps it where the user can actually see it: the
@@ -340,38 +366,77 @@ fn activate_app(app: &NSApplication) {
 /// wouldn't wake up, and an enrolment dialog started while a session is running
 /// would be hidden the same way - the black windows are at the screensaver
 /// level, so an ordinary panel can never reach them.
-fn show_modal(alert: &NSAlert, mtm: MainThreadMarker) -> NSModalResponse {
+/// Shows an alert modally.
+///
+/// `at_the_lock_screen` is what separates the two situations this has to serve:
+///
+/// - **an ordinary dialog** (enrolment, a report, a confirmation): activate once,
+///   show it, and then leave the user's focus alone. There is nothing to fight
+///   for - the desktop is right there, and the app the user is typing into is
+///   theirs. beta5 kept fighting twice a second and the dialog came out
+///   invisible: the panel was hidden every time the system deactivated us, and
+///   shown again when it let us activate, which is the flicker and the focus
+///   stealing in the log.
+/// - **the lock screen's password box**: this process owns the whole screen at
+///   that point (the black windows are at the screensaver level), so it has to
+///   keep the box above them and keep it key, which is what the timer is for -
+///   and only for that case.
+fn show_modal(alert: &NSAlert, mtm: MainThreadMarker, at_the_lock_screen: bool) -> NSModalResponse {
     let app = NSApplication::sharedApplication(mtm);
-    // An accessory process (the tray-started helper, or the session itself)
-    // can't become active, and a window can only be key in an active app - so
-    // for as long as a dialog is up, this is a regular app.
-    let policy = app.activationPolicy();
-    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
-    app.unhide(None);
-    activate_app(&app);
+    // Regular policy only at the lock screen, and only while the box is up: with
+    // black windows covering everything the Dock icon can't be seen anyway, and
+    // an accessory app that the system won't let become active can't have a key
+    // window - so the box couldn't take typing. For every other dialog the
+    // process keeps the policy it started with, which is what beta3 did and what
+    // keeps a Dock icon from appearing while someone enrols a password.
+    let policy = at_the_lock_screen.then(|| {
+        let previous = app.activationPolicy();
+        app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+        previous
+    });
 
     let window = alert.window();
+    // The single most likely reason a dialog of ours can be on screen, at the
+    // right level, at the right frame, and still not be seen: NSAlert's window
+    // is an NSPanel, and panels default to `hidesOnDeactivate = YES`. A process
+    // the system deactivates (which is what happens when the user is typing in
+    // Terminal) then hides its own panel, and it stays hidden until something
+    // makes the app active again.
+    window.setHidesOnDeactivate(false);
     raise_above_black_out(&window);
     let where_ = centre_on_cursor_display(&window, mtm);
+    activate_app(&app);
     window.makeKeyAndOrderFront(None);
-    keep_prompt_on_top(&window);
+    if at_the_lock_screen {
+        keep_prompt_on_top(&window);
+    }
     let frame = window.frame();
-    // Whether this is *really* key can't be seen here: a panel becomes key
-    // inside the modal loop, so `isKeyWindow` is false at this point even when
-    // everything is working. The keep-on-top timer reports it from inside that
-    // loop, where the answer means something.
+    // Key state is not meaningful here: a panel becomes key inside the modal
+    // loop, so it is false at this point even when everything works. The timer
+    // reports it from inside the loop when there is a timer; for the plain
+    // dialog this line plus the alert's own response code is the record.
     log!(
-        "Dialog {:?} shown {where_}: level {}, frame ({}, {}, {}x{}); key state reported by the timer.",
+        "Dialog {:?} shown {where_}: level {}, frame ({}, {}, {}x{}), hidesOnDeactivate {}, \
+         visible {}, occlusion {:?}, app active {}, timer {}.",
         window.title().to_string(),
         window.level(),
         frame.origin.x,
         frame.origin.y,
         frame.size.width,
-        frame.size.height
+        frame.size.height,
+        window.hidesOnDeactivate(),
+        window.isVisible(),
+        window.occlusionState(),
+        app.isActive(),
+        at_the_lock_screen
     );
     let answer = alert.runModal();
-    stop_keeping_prompt_on_top();
-    app.setActivationPolicy(policy);
+    if at_the_lock_screen {
+        stop_keeping_prompt_on_top();
+    }
+    if let Some(policy) = policy {
+        app.setActivationPolicy(policy);
+    }
     answer
 }
 
@@ -384,6 +449,10 @@ thread_local! {
     // instead of twice a second the same thing.
     static PROMPT_TICKS: Cell<u32> = const { Cell::new(0) };
     static PROMPT_KEY: Cell<bool> = const { Cell::new(false) };
+    // Which tick last asked for activation, so the ask is rate limited: with a
+    // start value of 0 the first re-activation happens two seconds in (four
+    // ticks), by which point show_modal's own single ask has had time to land.
+    static PROMPT_LAST_ACTIVATE: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Puts the prompt on the display the pointer is on, centred. Without this it
@@ -428,22 +497,49 @@ fn keep_prompt_on_top(window: &Retained<NSWindow>) {
     PROMPT_WINDOW.with(|slot| *slot.borrow_mut() = Some(window.clone()));
     PROMPT_TICKS.set(0);
     PROMPT_KEY.set(false);
+    PROMPT_LAST_ACTIVATE.set(0);
     let block = RcBlock::new(|_timer: NonNull<NSTimer>| {
         PROMPT_WINDOW.with(|slot| {
             let Some(window) = slot.borrow().clone() else {
                 return;
             };
-            raise_above_black_out(&window);
-            // Not just ordered front: the box has to be *key*, or keystrokes
-            // go to whatever else the system decided is frontmost.
-            window.makeKeyAndOrderFront(None);
-            if let Some(mtm) = MainThreadMarker::new() {
-                activate_app(&NSApplication::sharedApplication(mtm));
-            }
-            let key = window.isKeyWindow();
             let tick = PROMPT_TICKS.get();
             PROMPT_TICKS.set(tick + 1);
+            let key = window.isKeyWindow();
             let was = PROMPT_KEY.get();
+
+            if tick == 0 {
+                // The state that actually decides whether the user can see and
+                // type into the box, taken while the modal loop is running.
+                if let Some(mtm) = MainThreadMarker::new() {
+                    log!(
+                        "Lock prompt in its modal loop: level {}, key window: {key}, visible {}, hidesOnDeactivate {}, occlusion {:?}, app active {}.",
+                        window.level(),
+                        window.isVisible(),
+                        window.hidesOnDeactivate(),
+                        window.occlusionState(),
+                        NSApplication::sharedApplication(mtm).isActive()
+                    );
+                }
+            }
+
+            if !key {
+                // Lost key: raise and take it back. Not just ordered front -
+                // keystrokes go to whatever window the system decided is key.
+                raise_above_black_out(&window);
+                window.makeKeyAndOrderFront(None);
+                // Re-activating is the part the OS can refuse, and beta5's
+                // twice-a-second asking is what made focus flap. At most once
+                // every two seconds, and only while the box isn't key.
+                if tick.saturating_sub(PROMPT_LAST_ACTIVATE.get()) >= 4 {
+                    PROMPT_LAST_ACTIVATE.set(tick);
+                    if let Some(mtm) = MainThreadMarker::new() {
+                        log!("Lock prompt is not key; asking for activation again (tick {}).", tick + 1);
+                        activate_app(&NSApplication::sharedApplication(mtm));
+                    }
+                }
+            }
+
             if tick == 0 || key != was {
                 PROMPT_KEY.set(key);
                 log!(
@@ -490,7 +586,7 @@ pub fn notify(title: &str, message: &str) {
     alert.setMessageText(&NSString::from_str(title));
     alert.setInformativeText(&NSString::from_str(message));
     alert.addButtonWithTitle(&NSString::from_str("OK"));
-    show_modal(&alert, mtm);
+    show_modal(&alert, mtm, false);
 }
 
 pub fn ask_yes_no(title: &str, message: &str) -> bool {
@@ -503,7 +599,7 @@ pub fn ask_yes_no(title: &str, message: &str) -> bool {
     // The first button is the default one, so it's what Return gives us.
     alert.addButtonWithTitle(&NSString::from_str("Yes"));
     alert.addButtonWithTitle(&NSString::from_str("No"));
-    let answer = show_modal(&alert, mtm);
+    let answer = show_modal(&alert, mtm, false);
     log!(
         "Confirmation dialog {title:?}: response {answer} -> {}.",
         if accepted(answer) { "yes" } else { "no" }

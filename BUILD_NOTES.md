@@ -168,6 +168,30 @@ Driving a prompt-driven CLI command without a GUI:
 - `catch-objc-exceptions` is enabled **only** in the macOS CI job (see the earlier bullet on
   the Objective-C compiler); without it `try_objc` is a pass-through, so the exception
   handlers above are what make a failure readable.
+- **`NSAlert`'s window is an `NSPanel`, and panels default to `hidesOnDeactivate = YES`.** A
+  background process that the system keeps deactivating therefore hides its own dialog: the
+  log shows the right level, an on-screen frame and a key window one tick later, and the user
+  sees nothing. `setHidesOnDeactivate(false)` on every window this app shows, dialogs and
+  black windows alike.
+- **Never ask for activation in a poll loop.** Since macOS 14 `-activate` is cooperative - a
+  request the system grants and withdraws as it likes. Asking twice a second made the key
+  window flap between true and false and stole focus from the user's terminal every other
+  tick. Activate once before entering the modal loop; if a timer must re-assert, make it act
+  only when the window has actually lost key, and rate-limit the activation part.
+- An app can be `.accessory` and still be active and own a key window; `.regular` is only
+  needed for Apple's own biometric prompt (and even there, only because the system won't show
+  it for a process that can't become active). Flipping to `.regular` for ordinary dialogs is
+  what puts an unexplained Dock icon in front of the user.
+- `NSApplicationActivationOptions::ActivateIgnoringOtherApps` is documented as having no
+  effect since macOS 14, and `-[NSApplication activateIgnoringOtherApps:]` is deprecated -
+  `NSRunningApplication::activateWithOptions(ActivateAllWindows)` plus (on 14+)
+  `-[NSApplication activate]` is the current pair, and the tray process the user clicked can
+  `-[NSApplication yieldActivationToApplication:]` the child's `NSRunningApplication` to make
+  that request stick.
+- `+[NSRunningApplication runningApplicationWithProcessIdentifier:]` is behind objc2-app-kit's
+  **`libc`** feature (the argument is `pid_t`), and `NSObjectProtocol::respondsToSelector`
+  needs `objc2-foundation` with the `NSObject` feature - use those instead of writing a
+  `msg_send!` for a feature probe.
 - Escape hatches to keep in mind when changing any of this: nothing may leave the black screen
   up with no prompt - the gate is cancellable by the session-taken flag, the main loop wakes on
   a timer rather than on events alone, a dying process always removes the windows, and
