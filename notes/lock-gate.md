@@ -1178,8 +1178,37 @@ darwin targets, and the `catch-objc-exceptions` build; `timeout 60 cargo test
 macOS-only tests (`the_password_box_follows_the_pointer`,
 `the_pointer_counter_acts_once_per_change`) run on the workflow's macOS leg.
 
+### Release record: v0.2.2beta7 (pre-release), tag at `7411b9b`
 
-## Sources
+https://github.com/ilyatbn/sleepless/releases/tag/v0.2.2beta7
+
+Run 27 (`e5c66a3`) failed on the macOS leg - on the **test**, not the code: the
+expected numbers for the cursor-counter walk were written from the shape of the
+sequence instead of being computed from it (nine requests starting visible act
+three times each way and end visible; the assert said 4 hides and "hidden").
+Fixed by making the test check the invariant at every step - an action flips the
+state, a no-op never does - and by working the same sequence through separately.
+The geometry test's assertions were checked the same way, by mirroring
+`pick_box_window` into a throwaway file and running it, since neither test can be
+run on this machine at all.
+
+Run 28 (`7411b9b`): version, linux x2, **windows (unit tests included)**,
+**macos (unit tests included, twice - plain and with `catch-objc-exceptions`
+compiled)**, release: all success.
+
+Shipped macOS binaries checked with `strings` (universal, so both slices):
+`Click this screen to type your password`, `Too many attempts - wait`,
+`The keyboard does NOT belong to Sleepless`, `The keyboard belongs to Sleepless
+again`, `Black screen: this app is the one the keyboard belongs to`, `Not asking
+Touch ID while another app owns the keyboard`, `Escape does not unlock Sleepless`,
+`Hiding the pointer`, and `Sleepless 0.2.2-beta.7`; the tray app carries
+`activation requested; this app is the active app`. Windows and Linux binaries
+carry `0.2.2-beta.7` too.
+
+The lesson worth keeping: an expected value in a test is arithmetic. Compute it
+before writing it down, especially for a test that can only ever run on a machine
+nobody here has.
+
 
 - https://learn.microsoft.com/windows/win32/api/winreg/nf-winreg-regcreatekeyexw
 - https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-createwindowexw
