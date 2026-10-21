@@ -98,7 +98,9 @@ impl Settings {
 
     fn save(&self) {
         let Some(path) = Self::path() else { return };
-        let _ = fs::create_dir_all(path.parent().unwrap());
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
         if let Err(e) = fs::write(&path, format!("asroot={}\n", self.asroot)) {
             eprintln!("Sleepless: could not save {}: {e}", path.display());
         }

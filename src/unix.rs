@@ -10,6 +10,7 @@
 // killed or crash - so nothing is ever left behind.
 
 use std::env;
+use std::io;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
@@ -170,6 +171,18 @@ pub fn wait_until(child: &mut Child, timeout: Duration, mut check: impl FnMut() 
         thread::sleep(Duration::from_millis(250));
     }
     false
+}
+
+/// Starts a thread without the possibility of a panic: `std::thread::spawn`
+/// panics if the OS refuses, and a panic in a locked session (with the black
+/// windows already up) is exactly the thing that must not happen unannounced.
+pub fn spawn_thread(name: &str, f: impl FnOnce() + Send + 'static) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(f)
+        .map(|handle| {
+            drop(handle);
+        })
 }
 
 /// Blocks until the user comes back, judged by an idle-time counter that

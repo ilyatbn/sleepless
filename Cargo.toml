@@ -1,6 +1,6 @@
 [package]
 name = "sleepless"
-version = "0.2.2-beta.4"
+version = "0.2.2-beta.5"
 edition = "2021"
 
 [[bin]]
@@ -21,7 +21,12 @@ winresource = "0.1"
 opt-level = "z"
 lto = true
 strip = true
-panic = "abort"
+# Not `panic = "abort"`: it marks every Rust frame nounwind, which turns any
+# Objective-C exception (on macOS) into an abort that cannot be caught by
+# `objc2::exception::catch` - that is exactly how two betas died with nothing in
+# the log. Unwinding lets the guards work, lets a panic on a helper thread be
+# survived, and leaves a usable crash report.
+panic = "unwind"
 
 # Salted password hashing for the "come back" prompt (src/lock.rs) plus the OS
 # random number generator for its salt. Both are pure Rust and build for every

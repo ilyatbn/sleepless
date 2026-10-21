@@ -271,7 +271,7 @@ fn session_locked() -> Option<bool> {
 /// client library, and a query every few seconds is cheap next to the idle
 /// polling this backend already does.
 fn watch_session_locks() {
-    thread::spawn(|| {
+    if let Err(e) = unix::spawn_thread("sleepless-lock-watcher", || {
         loop {
             thread::sleep(Duration::from_secs(3));
             match session_locked() {
@@ -286,12 +286,16 @@ fn watch_session_locks() {
                 None => {}
             }
         }
-    });
+    }) {
+        log!("Could not start the lock watcher: {e}; locking the session won't end this run.");
+    }
 }
 
-pub fn run(opts: crate::Options) {
-    watch_session_locks();
+/// Nothing to install here: the Linux backend spawns askpass helpers rather
+/// than talking to a GUI toolkit, so there are no foreign exceptions to catch.
+pub fn install_crash_reporting() {}
 
+pub fn run(opts: crate::Options) {
     if unix::is_root() && env::var_os("SUDO_USER").is_some() {
         eprintln!(
             "Sleepless: running under sudo usually can't reach your desktop session to turn the display off.\n\
@@ -315,6 +319,12 @@ pub fn run(opts: crate::Options) {
         Backend::None => false,
     };
 
+    // Start watching for the desktop locking the session only now that the
+    // display is off: whatever the lock state was before, it isn't something we
+    // caused, and ending the run because the screensaver was already showing
+    // would be nonsense.
+    watch_session_locks();
+
     // --- 3. Wait for the user to come back ---
     let returned = match backend {
         _ if !turned_off => false,
@@ -329,8 +339,11 @@ pub fn run(opts: crate::Options) {
                 waited += 1;
             }
             log!("Waiting for the monitor to come back on (move the mouse / press a key)...");
-            while x11_monitor_on() == Some(false) {
+            while x11_monitor_on() == Some(false) && !session_was_taken() {
                 thread::sleep(Duration::from_secs(1));
+            }
+            if session_was_taken() {
+                log!("The session was locked while the monitor was off.");
             }
             true
         }
@@ -348,9 +361,12 @@ pub fn run(opts: crate::Options) {
         if unix::has_tty() {
             let _ = std::io::stdin().read_line(&mut line);
         } else {
-            loop {
-                thread::sleep(Duration::from_secs(3600));
+            // No terminal to wait on: hold the machine awake until the session
+            // is locked (the watcher sets the flag) or the process is killed.
+            while !session_was_taken() {
+                thread::sleep(Duration::from_secs(5));
             }
+            log!("The session was locked; releasing the inhibitor and exiting.");
         }
     }
 
@@ -391,11 +407,14 @@ pub fn run(opts: crate::Options) {
 /// thing to use when a real boundary is needed.
 fn unlock_gate() {
     log!("A password is enrolled: asking before restoring the power settings.");
-    lock::unlock_loop(
+    if lock::unlock_loop(
         |message| prompt_secret("Sleepless", message),
         session_was_taken,
-    );
-    log!("Password accepted - restoring the power settings.");
+    ) {
+        log!("Password accepted - restoring the power settings.");
+    } else {
+        log!("Gate ended without a password: the session was taken over.");
+    }
 }
 
 // ---------------------------------------------------------------------

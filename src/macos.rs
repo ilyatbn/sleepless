@@ -39,7 +39,9 @@ use objc2_app_kit::{
 };
 use objc2_foundation::NSDefaultRunLoopMode;
 
-use crate::unix::{self, fail, run_ok, run_output, spawn, spawn_as_root, wait_for_our_exit_sh};
+use crate::unix::{
+    self, fail, run_ok, run_output, spawn, spawn_as_root, spawn_thread, wait_for_our_exit_sh,
+};
 
 pub use crate::unix::{debug_log, init_logging};
 
@@ -135,7 +137,12 @@ fn black_out(mtm: MainThreadMarker) -> Vec<Retained<NSWindow>> {
     // that brings you back lands here rather than in whatever app was
     // active.
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
-    let windows: Vec<_> = NSScreen::screens(mtm)
+    let screens = NSScreen::screens(mtm);
+    log!(
+        "Making one black window per display ({} of them).",
+        screens.len()
+    );
+    let windows: Vec<_> = screens
         .iter()
         .map(|screen| {
             let frame = screen.frame();
@@ -164,9 +171,17 @@ fn black_out(mtm: MainThreadMarker) -> Vec<Retained<NSWindow>> {
         })
         .collect();
     log!("Blacked out {} display(s).", windows.len());
-    #[allow(deprecated)] // activate() is macOS 14+; this still works there
-    app.activateIgnoringOtherApps(true);
-    NSCursor::hide();
+    log!("Bringing the app forward and hiding the pointer.");
+    // Guarded because a failure here must not take the black windows with it.
+    let outcome = unsafe { try_objc(|| activate_app(&app)) };
+    if let Err(why) = outcome {
+        log!("Activating the app failed: {why} - continuing anyway.");
+    }
+    let outcome = unsafe { try_objc(|| hide_cursor()) };
+    if let Err(why) = outcome {
+        log!("Hiding the pointer failed: {why} - continuing anyway.");
+    }
+    log!("Black screen ready.");
     windows
 }
 
@@ -189,8 +204,9 @@ fn sleep_disabled() -> Option<bool> {
 use crate::lock::{self, Secret};
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
-/// The alert panel we're currently showing, if any, so the lock screen can
-/// raise it above the black windows.
+/// Puts a window above this app's black windows (which sit at the screensaver
+/// level) and makes it follow the user across spaces, so a dialog is never
+/// underneath the very thing it is supposed to be drawn on top of.
 fn raise_above_black_out(window: &NSWindow) {
     window.setLevel(SCREEN_SAVER_WINDOW_LEVEL + 1);
     window.setCollectionBehavior(
@@ -236,14 +252,13 @@ fn secret_alert(
     (alert, field)
 }
 
-/// An NSAlert numbers its buttons by the order they were added, starting at
-/// NSAlertFirstButtonReturn (1000) - *not* NSModalResponseOK (1), which is what
-/// a hand-rolled modal window uses. Comparing against NSModalResponseOK made
-/// every button look like a cancellation, which is exactly the "cancelled: no
-/// password was set" symptom.
-/// NSAlert's buttons answer with NSAlertFirstButtonReturn / Second / Third,
-/// numbered by the order they were added; NSModalResponseAbort means the alert
-/// was dismissed some other way (Escape, the close box).
+/// NSAlert's buttons answer with NSAlertFirstButtonReturn (1000) / Second (1001)
+/// / Third (1002), numbered by the order they were added - *not* with
+/// NSModalResponseOK (1), which is what a hand-rolled modal window uses.
+/// NSModalResponseAbort means the alert was dismissed another way (Escape, the
+/// close box). Comparing against NSModalResponseOK made every button look like a
+/// cancellation, which is exactly the "cancelled: no password was set" symptom.
+/// The test below pins the numbers.
 pub fn accepted(answer: NSModalResponse) -> bool {
     answer == NSAlertFirstButtonReturn
 }
@@ -268,16 +283,10 @@ pub fn prompt_secret(title: &str, message: &str) -> Option<Secret> {
         log!("prompt_secret: not on the main thread, cannot show a dialog.");
         return None;
     };
-    let app = NSApplication::sharedApplication(mtm);
-    let policy = app.activationPolicy();
-    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
-    #[allow(deprecated)] // activate() is macOS 14+; this still works there
-    app.activateIgnoringOtherApps(true);
-
     log!("Showing the password dialog: {title} / {message}");
+    // show_modal handles activation and the activation policy for us.
     let (alert, field) = secret_alert(mtm, title, message, true);
     let answer = show_modal(&alert, mtm);
-    app.setActivationPolicy(policy);
     secret_from(&field, answer, "password dialog")
 }
 
@@ -294,12 +303,14 @@ fn prompt_secret_locked(title: &str, message: &str) -> Option<Secret> {
         log!("prompt_secret_locked: not on the main thread, cannot show a prompt.");
         return None;
     };
-    let app = NSApplication::sharedApplication(mtm);
-    #[allow(deprecated)] // activate() is macOS 14+; this still works there
-    app.activateIgnoringOtherApps(true);
-
+    // The pointer has to be visible for this: it's the one thing on the black
+    // screen the user might want to point at, and beta3's report of "no prompt
+    // anywhere" was helped by there being no cursor to see either.
+    show_cursor();
     let (alert, field) = secret_alert(mtm, title, message, false);
     let answer = show_modal(&alert, mtm);
+    // Back to black between attempts.
+    hide_cursor();
     secret_from(&field, answer, "lock screen prompt")
 }
 
@@ -508,18 +519,55 @@ pub fn ask_yes_no(title: &str, message: &str) -> bool {
 fn pump_events_until(mtm: MainThreadMarker, stop: impl Fn() -> bool) {
     let app = NSApplication::sharedApplication(mtm);
     while !stop() {
+        // A bounded wait, deliberately: with `untilDate: nil` this call sleeps
+        // until an event arrives *for this app*, and a black-screen session is
+        // usually not the active app - the keyboard/mouse input that the other
+        // thread notices goes to whoever is. So the flags it sets
+        // (BACK / UNLOCKED / session taken) could go unseen forever, which is a
+        // black screen with no prompt and no way out. Waking every 40ms means
+        // the flags are always seen, event or no event.
+        let until = NSDate::dateWithTimeIntervalSinceNow(0.04);
         while let Some(event) = unsafe {
             app.nextEventMatchingMask_untilDate_inMode_dequeue(
                 NSEventMask::Any,
-                None,
+                Some(&until),
                 NSDefaultRunLoopMode,
                 true,
             )
         } {
             app.sendEvent(&event);
         }
-        thread::sleep(Duration::from_millis(40));
     }
+}
+
+// ---------------------------------------------------------------------
+// The pointer
+//
+// It's hidden for the black screen, so it isn't sitting in the middle of a
+// dark monitor. But a prompt you can't see the pointer for is worse than a
+// stray dot, so it comes back for anything the user has to read or answer -
+// including Apple's own Touch ID panel, whose "Use Password…" and "Cancel"
+// buttons are otherwise unreachable by mouse. Hide/unhide are counted by
+// AppKit, so the counter below keeps them balanced, and both are only ever
+// called on the main thread.
+// ---------------------------------------------------------------------
+
+static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+fn hide_cursor() {
+    if !CURSOR_HIDDEN.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    log!("Hiding the pointer.");
+    NSCursor::hide();
+}
+
+fn show_cursor() {
+    if !CURSOR_HIDDEN.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    log!("Showing the pointer again.");
+    NSCursor::unhide();
 }
 
 // ---------------------------------------------------------------------
@@ -704,6 +752,9 @@ pub fn passkey_enroll() -> Result<&'static str, String> {
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     activate_app(&app);
     log!("Asking the system to confirm your identity for the passkey.");
+    // No black screen during enrolment, so this only undoes a hide if one
+    // happened; nothing needs re-hiding afterwards.
+    show_cursor();
     let confirmed = evaluate(&ctx, REASON_ENROL, mtm);
     app.setActivationPolicy(policy);
     if confirmed {
@@ -721,10 +772,20 @@ fn passkey_unlock(mtm: MainThreadMarker) -> bool {
         log!("A passkey is enrolled but Touch ID isn't available right now: {why}");
         return false;
     }
-    // The system's prompt only appears in front of an active app.
-    activate_app(&NSApplication::sharedApplication(mtm));
+    // The system's prompt only appears in front of an active app, and an
+    // accessory process can't become active at all.
+    let app = NSApplication::sharedApplication(mtm);
+    let policy = app.activationPolicy();
+    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    activate_app(&app);
     log!("Lock screen trying the passkey before the password box.");
-    evaluate(&ctx, REASON_UNLOCK, mtm)
+    // Apple's panel has Cancel and "Use Password…" buttons; with the pointer
+    // hidden they can't be reached.
+    show_cursor();
+    let answered = evaluate(&ctx, REASON_UNLOCK, mtm);
+    hide_cursor();
+    app.setActivationPolicy(policy);
+    answered
 }
 
 // ---------------------------------------------------------------------
@@ -770,7 +831,9 @@ fn watch_session_resign() {
         let name = unsafe { note.as_ref() }.name();
         session_taken(&format!("Session notification {name:?}"));
     });
+    log!("Session watch: asking NSWorkspace for its notification centre.");
     let center = NSWorkspace::sharedWorkspace().notificationCenter();
+    log!("Session watch: subscribing to the session-resign notification.");
     let outcome = unsafe {
         try_objc(|| {
             center.addObserverForName_object_queue_usingBlock(
@@ -783,6 +846,7 @@ fn watch_session_resign() {
     };
     match outcome {
         Ok(token) => {
+            log!("Session watch: subscribed; keeping the token alive.");
             OBSERVERS.with(|observers| observers.borrow_mut().push(token));
             log!("Watching for the session being resigned (NSWorkspace).");
         }
@@ -799,9 +863,9 @@ fn watch_session_resign() {
 // nothing in this file hand-writes a selector's argument list.
 define_class!(
     #[unsafe(super(NSObject))]
-    struct LockWatcher;
+    struct SleeplessLockWatcher;
 
-    impl LockWatcher {
+    impl SleeplessLockWatcher {
         #[unsafe(method(sleeplessSessionLockChanged:))]
         fn session_lock_changed(&self, note: Option<&NSNotification>) {
             let name = note
@@ -815,84 +879,193 @@ define_class!(
 // The observer objects have to outlive the subscription, unlike the tokens
 // from the block API.
 thread_local! {
-    static WATCHERS: RefCell<Vec<Retained<LockWatcher>>> = const { RefCell::new(Vec::new()) };
+    static WATCHERS: RefCell<Vec<Retained<SleeplessLockWatcher>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// `com.apple.screenIsLocked`, posted by loginwindow for Ctrl+Cmd+Q, the lock
+/// `com.apple.screenIsLocked`, posted by loginwindow for `Ctrl+Cmd+Q`, the lock
 /// button and a screensaver lock. Never documented as public API, stable for
 /// decades, and the only signal for the most common case.
 ///
-/// A beta reached for `addObserverForName:object:queue:options:usingBlock:`
-/// with a hand-written selector, argument list and return type; the run aborted
-/// inside this function, before the black windows existed, so "turn display off"
-/// did nothing at all. So now: the documented selector observer, through
-/// objc2-foundation's typed binding, with the typed block observer as a
-/// fallback, everything wrapped so a failure is a log line, and this whole
-/// function running only after the screen is already black.
+/// Two betas died here. The first hand-wrote
+/// `addObserverForName:object:queue:options:usingBlock:`; the second sent
+/// `+distributedNotificationCenter`, which **does not exist** - Apple's
+/// `NSDistributedNotificationCenter` has `+defaultCenter` (and
+/// `+notificationCenterForType:`), and the made-up one produced
+/// `-[NSDistributedNotificationCenter distributedNotificationCenter]: unrecognized
+/// selector`, an Objective-C exception that cannot unwind through Rust frames, so
+/// the process aborted a moment after the black windows went up and the display
+/// came straight back. So this version: the right selector, every step logged
+/// before and after, the whole body inside one exception guard, and an outer
+/// panic guard, so the worst case is a log line and a session without the
+/// screen-lock shortcut.
 fn watch_screen_is_locked() {
-    let Some(cls) = AnyClass::get(c"NSDistributedNotificationCenter") else {
+    if env::var_os("SLEEPLESS_NO_SCREEN_LOCK_WATCH").is_some_and(|v| v != "0") {
+        log!(
+            "Screen-lock watch disabled by SLEEPLESS_NO_SCREEN_LOCK_WATCH: Ctrl+Cmd+Q won't \
+              end the run, but everything else works."
+        );
+        return;
+    }
+    // Two independent guards: the panic one catches a Rust panic (which with
+    // catch-all builds is also how a stray Objective-C exception reaches us),
+    // the Objective-C one inside catches the exception itself.
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(watch_screen_is_locked_inner));
+    match outcome {
+        Ok(()) => {}
+        Err(payload) => log!(
+            "Screen-lock watch stopped itself: {} - carrying on without it.",
+            crate::logging::panic_message(payload.as_ref(), None)
+        ),
+    }
+}
+
+fn watch_screen_is_locked_inner() {
+    log!("Screen-lock watch: looking up NSDistributedNotificationCenter.");
+    if AnyClass::get(c"NSDistributedNotificationCenter").is_none() {
         log!("No NSDistributedNotificationCenter on this system; a screen lock won't be noticed.");
         return;
-    };
-    // +distributedNotificationCenter: no arguments, returns the shared centre.
-    // The one message here that has to be sent by hand, because objc2-app-kit
-    // has no bindings for this class.
-    let center: *mut AnyObject = unsafe { msg_send![cls, distributedNotificationCenter] };
-    let Some(center) = (unsafe { Retained::retain(center) }) else {
-        log!("NSDistributedNotificationCenter gave us no shared centre; a screen lock won't be noticed.");
-        return;
-    };
-    // Runtime-checked, rather than us asserting the class hierarchy: the
-    // distributed centre is an NSNotificationCenter subclass, which is what
-    // makes the typed observer methods apply to it.
-    let Ok(center) = center.downcast::<NSNotificationCenter>() else {
-        log!("The distributed notification centre isn't an NSNotificationCenter here; skipping.");
-        return;
-    };
-    // NSNotificationName is a typealias for NSString in these bindings.
-    let name = NSString::from_str("com.apple.screenIsLocked");
+    }
 
-    // Primary: the selector observer.
-    let observer: Retained<LockWatcher> = unsafe { msg_send![LockWatcher::class(), new] };
+    // +defaultCenter, inside the guard: this is where beta3 and beta4 threw
+    // (beta4 sent +distributedNotificationCenter, which isn't a method of this
+    // class - the documented ones are +defaultCenter and +notificationCenterForType:).
+    let center = unsafe { try_objc(|| distributed_center()) };
+    let center = match center {
+        Ok(Some(center)) => center,
+        Ok(None) => {
+            log!("Screen-lock watch: no usable distributed notification centre; giving up.");
+            return;
+        }
+        Err(why) => {
+            log!("Screen-lock watch: asking for the distributed centre raised {why}; giving up.");
+            return;
+        }
+    };
+
+    // Primary: the selector observer, the oldest subscription API this class
+    // has ever had. Everything Objective-C, including the strings, is inside a
+    // guard - no step of this function runs unprotected.
     let subscribed = unsafe {
         try_objc(|| {
+            let name = NSString::from_str("com.apple.screenIsLocked");
+            log!("Screen-lock watch: creating the SleeplessLockWatcher observer.");
+            let observer: Retained<SleeplessLockWatcher> =
+                msg_send![SleeplessLockWatcher::class(), new];
+            log!("Screen-lock watch: addObserver:selector:name:object:.");
             center.addObserver_selector_name_object(
                 &observer,
                 sel!(sleeplessSessionLockChanged:),
                 Some(&name),
                 None,
-            )
+            );
+            log!("Screen-lock watch: subscribed; keeping the observer alive.");
+            WATCHERS.with(|watchers| watchers.borrow_mut().push(observer));
         })
     };
-    if subscribed.is_ok() {
-        WATCHERS.with(|watchers| watchers.borrow_mut().push(observer));
-        log!("Watching for com.apple.screenIsLocked (selector observer).");
-        return;
+    match subscribed {
+        Ok(()) => {
+            log!("Watching for com.apple.screenIsLocked (selector observer).");
+            return;
+        }
+        Err(why) => log!(
+            "Screen-lock watch: the selector observer failed: {why}; trying the block observer."
+        ),
     }
 
     // Fallback: the block observer, kept alive by its token.
-    log!(
-        "Selector observer for com.apple.screenIsLocked failed ({}); trying the block observer.",
-        subscribed.unwrap_err()
-    );
-    let block = RcBlock::new(|_note: NonNull<NSNotification>| {
-        session_taken("com.apple.screenIsLocked");
-    });
-    let outcome = unsafe {
+    let block_outcome = unsafe {
         try_objc(|| {
-            center.addObserverForName_object_queue_usingBlock(Some(&name), None, None, &block)
+            let name = NSString::from_str("com.apple.screenIsLocked");
+            let block = RcBlock::new(|_note: NonNull<NSNotification>| {
+                session_taken("com.apple.screenIsLocked");
+            });
+            log!("Screen-lock watch: addObserverForName:object:queue:usingBlock:.");
+            let token =
+                center.addObserverForName_object_queue_usingBlock(Some(&name), None, None, &block);
+            OBSERVERS.with(|observers| observers.borrow_mut().push(token));
         })
     };
-    match outcome {
-        Ok(token) => {
-            OBSERVERS.with(|observers| observers.borrow_mut().push(token));
-            log!("Watching for com.apple.screenIsLocked (block observer).");
-        }
+    match block_outcome {
+        Ok(()) => log!("Watching for com.apple.screenIsLocked (block observer)."),
         Err(why) => log!(
             "Could not watch for com.apple.screenIsLocked: {why} - a screen lock is still caught \
              by the session-resign watch where that applies, and killing the process always works."
         ),
     }
+}
+
+/// The shared distributed notification centre, checked to be an
+/// `NSNotificationCenter` (which Apple documents as its superclass, and which is
+/// what makes objc2-foundation's typed observer methods valid on it). Every step
+/// is logged, so a report says exactly how far this got.
+///
+/// # Safety
+///
+/// Sends Objective-C messages; call it through `try_objc`.
+unsafe fn distributed_center() -> Option<Retained<NSNotificationCenter>> {
+    let cls = AnyClass::get(c"NSDistributedNotificationCenter")?;
+    log!("Screen-lock watch: +defaultCenter.");
+    let center: *mut AnyObject = msg_send![cls, defaultCenter];
+    let Some(center) = (unsafe { Retained::retain(center) }) else {
+        log!("Screen-lock watch: +defaultCenter returned nothing.");
+        return None;
+    };
+    log!("Screen-lock watch: centre retained; checking the class.");
+    let Ok(center) = center.downcast::<NSNotificationCenter>() else {
+        log!("Screen-lock watch: the centre isn't an NSNotificationCenter here.");
+        return None;
+    };
+    log!("Screen-lock watch: centre is an NSNotificationCenter.");
+    Some(center)
+}
+
+// ---------------------------------------------------------------------
+// Objective-C exceptions: name themselves in the log
+//
+// An Objective-C exception cannot unwind through Rust frames. With
+// `panic = "abort"` in the release profile *every* Rust frame was nounwind, so
+// any exception - even one we'd wrapped in `try_objc` - ended as a SIGABRT whose
+// only trace was "panic in a function that cannot unwind". The release build now
+// unwinds, so the guards below can actually do their job, and these two handlers
+// make sure an exception we didn't think to guard still says what it was:
+//
+//   - the preprocessor runs the moment an exception is thrown, before any
+//     unwinding, so the log names the class, selector and reason;
+//   - the uncaught handler runs on the way out if nothing catches it.
+//
+// Both come from libobjc (`objc-exception.h`) and are reached through objc2's
+// raw FFI declarations, since there's no safer binding for them.
+// ---------------------------------------------------------------------
+
+unsafe extern "C" fn report_thrown_exception(exception: *mut AnyObject) -> *mut AnyObject {
+    let described: &objc2::exception::Exception =
+        unsafe { &*(exception as *const objc2::exception::Exception) };
+    crate::logging::note(&format!("Objective-C exception thrown: {described:?}"));
+    // Hand the same exception back on, unchanged.
+    exception
+}
+
+unsafe extern "C" fn report_uncaught_exception(exception: *mut AnyObject) {
+    let described: &objc2::exception::Exception =
+        unsafe { &*(exception as *const objc2::exception::Exception) };
+    crate::logging::note(&format!(
+        "Uncaught Objective-C exception; the process is about to die: {described:?}"
+    ));
+}
+
+/// Called for every macOS process, session or credential command: both talk to
+/// AppKit and LocalAuthentication, so both can meet an Objective-C exception.
+pub fn install_crash_reporting() {
+    install_exception_reporting();
+}
+
+fn install_exception_reporting() {
+    unsafe {
+        objc2::ffi::objc_setExceptionPreprocessor(report_thrown_exception);
+        objc2::ffi::objc_setUncaughtExceptionHandler(report_uncaught_exception);
+    }
+    log!("Objective-C exception reporting installed.");
 }
 
 /// Runs an Objective-C call, turning an exception into a logged failure instead
@@ -940,6 +1113,10 @@ fn release_and_exit() -> ! {
 static CAFFEINATE: Mutex<Option<Child>> = Mutex::new(None);
 
 pub fn run(opts: crate::Options) {
+    log!("Session starting (asroot: {}).", opts.asroot);
+    // Before anything else that can throw, so whatever the cause, the log names
+    // the exception rather than the run just stopping.
+    install_exception_reporting();
     install_quick_actions();
 
     // --- 1. Keep the system awake ---
@@ -976,23 +1153,27 @@ pub fn run(opts: crate::Options) {
     }
 
     // --- 3. Black screen ---
+    log!("Stage: the black screen.");
     let mtm = MainThreadMarker::new().unwrap_or_else(|| fail("must run on the main thread"));
     watch_session_resign();
     // A prompt that never got shown, or a session the user locked behind our
     // back, must never be what stands between them and their desktop: this
     // thread ends the run the moment macOS says the session is ours no more.
-    thread::spawn(|| {
+    if let Err(e) = spawn_thread("sleepless-session-watcher", || {
         while !session_was_taken() {
             thread::sleep(Duration::from_millis(500));
         }
         release_and_exit();
-    });
+    }) {
+        log!("Could not start the session watcher: {e} - Ctrl+Cmd+Q won't end the run by itself.");
+    }
     let _windows = black_out(mtm);
     // The riskier subscription comes after the screen is already black, so a
     // problem there can never stop the display from going off.
     watch_screen_is_locked();
 
     // --- 4. Wait for the user to come back ---
+    log!("Stage: waiting to be interrupted (activity, or the session being taken over).");
     // AppKit needs the main thread to keep the windows up, so the waiting
     // happens on another one, which also ends the process. With the gate armed
     // that thread only announces the return: the prompt has to be shown on the
@@ -1002,23 +1183,32 @@ pub fn run(opts: crate::Options) {
     // the run started, so a password enrolled while the screen was black still
     // gets asked for. The thread that sees the input records the answer in
     // GATE_ARMED before it raises BACK, so both threads agree.
-    thread::spawn(move || {
-        unix::wait_for_activity(|| Some(seconds_since_input()), session_was_taken);
-        if session_was_taken() {
-            log!("The session was taken over before anyone came back.");
-            release_and_exit();
-        }
-        let armed = lock::is_enrolled();
-        GATE_ARMED.store(armed, Ordering::SeqCst);
-        BACK.store(true, Ordering::SeqCst);
-        if armed {
-            log!("Welcome back - the password comes first.");
-            while !UNLOCKED.load(Ordering::SeqCst) && !session_was_taken() {
-                thread::sleep(Duration::from_millis(100));
+    let worker = std::thread::Builder::new()
+        .name("sleepless-activity-watcher".to_string())
+        .spawn(move || {
+            unix::wait_for_activity(|| Some(seconds_since_input()), session_was_taken);
+            if session_was_taken() {
+                log!("The session was taken over before anyone came back.");
+                release_and_exit();
             }
-        }
+            let armed = lock::is_enrolled();
+            GATE_ARMED.store(armed, Ordering::SeqCst);
+            BACK.store(true, Ordering::SeqCst);
+            if armed {
+                log!("Welcome back - the password comes first.");
+                while !UNLOCKED.load(Ordering::SeqCst) && !session_was_taken() {
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+            release_and_exit();
+        });
+    if let Err(e) = worker {
+        // Without the thread that notices the return, the gate can never be
+        // armed: say so, and end the run rather than leaving a black screen
+        // nobody can answer.
+        log!("Could not start the activity watcher: {e} - releasing and exiting.");
         release_and_exit();
-    });
+    }
 
     // Main thread: keep AppKit running, then handle the return.
     pump_events_until(mtm, || BACK.load(Ordering::SeqCst) || session_was_taken());

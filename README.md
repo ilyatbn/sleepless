@@ -135,6 +135,12 @@ is put back:
 So if a prompt ever fails to appear - or a run gets stuck for any reason - **lock the
 machine and Sleepless ends**. That's a deliberate safety valve, not a fallback.
 
+If a build ever misbehaves in that area, macOS's screen-lock watcher can be switched off
+without rebuilding anything: `SLEEPLESS_NO_SCREEN_LOCK_WATCH=1 sleepless …`. The log says it
+was disabled; everything else, including the password prompt, keeps working - only
+`Ctrl+Cmd+Q` stops ending the run by itself. On Linux the lock check starts once the display
+is actually off, so a screensaver that was already showing doesn't cut the run short.
+
 ### If something doesn't work: the log file
 
 Both Sleepless programs append to one plain-text log, started whether or not `--debug`

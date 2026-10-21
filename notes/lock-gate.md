@@ -557,6 +557,131 @@ use `LAPolicy::DeviceOwnerAuthenticationWithBiometrics`).
    "Distributed notification ..." or "Session notification ..." line.
 5. If anything still dies, the log should end with a `PANIC at ...` line.
 
+## beta5: full self-review of the branch (2026-10-21)
+
+Three betas shipped bugs that a careful read would have caught, so the whole branch was
+re-read as if written by someone not to be trusted, then re-read again after fixing.
+Every finding below is fixed unless marked as a known limitation.
+
+### The root cause of beta3 and beta4's missing black screen
+
+`watch_screen_is_locked()` sent **`+distributedNotificationCenter`, which is not a method
+of `NSDistributedNotificationCenter`**. Apple documents the class methods as
+`+defaultCenter` and `+notificationCenterForType:`; the made-up one produced
+`-[NSDistributedNotificationCenter distributedNotificationCenter]: unrecognized selector`,
+i.e. `doesNotRecognizeSelector:` -> an `NSException` thrown through
+`___forwarding___`/`_CF_forwarding_prep_0`, which cannot unwind through Rust frames.
+Confirmed independently: the user's `OBJC_PRINT_EXCEPTION_THROW=YES` trace showed exactly
+that path, and Apple's own docs page for the class lists only the two real accessors
+(plus "Inherits From: NSNotificationCenter", which is what makes the typed observer methods
+valid). beta3 died inside the same function with a hand-written block-observer selector,
+so both betas were the same class of mistake: **an invented Objective-C API**.
+
+### Findings, in the order they were found
+
+| # | Where | What was wrong | What it became |
+| --- | --- | --- | --- |
+| 1 | `watch_screen_is_locked` | `+distributedNotificationCenter` does not exist -> unrecognized selector -> abort, a moment after the black windows went up (so "turn display off" appeared to do nothing) | `+defaultCenter`, every step logged before and after |
+| 2 | `Cargo.toml` | `panic = "abort"` marks every Rust frame nounwind, so *no* Objective-C exception can ever reach a `@catch` - including one inside `objc2::exception::catch`, whose own source carries a "test this with panic=abort" TODO. It also turned each crash into the contentless "panic in a function that cannot unwind" | `panic = "unwind"` in the release profile, with the reason in the comment |
+| 3 | `try_objc` coverage | Only the two subscribe calls were guarded. The centre lookup, the retain, the `downcast`, the first `define_class!` class registration and the string creation were all outside it | one guard around `distributed_center()`, one around the selector subscription, one around the block fallback; plus `std::panic::catch_unwind` around the whole watcher so a panic there is a log line too |
+| 4 | nowhere | No last-resort reporting of an Objective-C exception: two crashes produced no name, no reason, no selector | `objc_setExceptionPreprocessor` (logs at throw time, with the exception's class, name and reason) and `objc_setUncaughtExceptionHandler` (logs on the way out), installed by `install_crash_reporting()` in **every** macOS process, session or credential command (`main.rs`), no-op on Windows/Linux |
+| 5 | `pump_events_until` | `nextEventMatchingMask:untilDate:inMode:dequeue:` was called with `untilDate: nil`, i.e. *block until an event arrives for this app*. During a black screen this app is usually not the active one, so the input the worker thread notices may never reach our queue: `BACK` / `UNLOCKED` / session-taken would go unseen forever - a black screen with no prompt and no exit, which is the failure this feature must never produce | bounded 40 ms slices, so the flags are always seen |
+| 6 | `black_out` | `NSCursor::hide()` was never balanced by an unhide: the pointer stayed invisible during the password prompt and during Apple's Touch ID panel (whose "Use Password…" / "Cancel" buttons were therefore unreachable by mouse); hide/unhide are counted by AppKit, so a bare unhide would have been wrong anyway | counted `hide_cursor()` / `show_cursor()` on a static flag, pointer back for every prompt (`prompt_secret_locked`, `passkey_unlock`, `passkey_enroll`), hidden again between attempts |
+| 7 | `watch_session_locks` (Linux) | Polling `loginctl`/the screensaver from the very start of the run: a session that was *already* showing a screensaver when Sleepless started would end the run instantly | the poller starts after the display is actually off |
+| 8 | X11 wait loop (Linux) | `while x11_monitor_on() == Some(false)` had no cancel: a locked session with the monitor still off would spin forever | `&& !session_was_taken()` plus a log line |
+| 9 | "keep awake" fallback (Linux) | With no terminal, `loop { sleep(3600) }` held the inhibitor lock forever, ignoring the lock watcher | waits on `session_was_taken()` and exits |
+| 10 | `edit_text` / `lock_overlay_ask` (Windows) | `&buf[..len.min(buf.len() as u32) as usize]` - `GetDlgItemTextW`'s return is `u32` here but the pattern is wrong in general, and any over-long/negative length would slice out of bounds and **panic on the lock screen**, killing the process and uncovering the desktop without ever asking for the password | one `utf16_prefix(buf, len)` helper that clamps to the buffer, used at both sites, with the failure mode spelled out in its comment |
+| 11 | Windows screensaver restore | If no screensaver was configured before, restoring wrote nothing: `SCRNSAVE.EXE` stayed pointed at the blank saver, quietly enabling it for the user | `RegDeleteValueW` when there was no previous value, with the result logged |
+| 12 | `unlock_loop` callers (Windows, Linux) | Logged "Password accepted." even when the gate ended because the session was taken over - a report would have said the opposite of what happened | each caller branches on the bool and logs which it was |
+| 13 | `prompt_secret` (macOS) | Duplicated the activation-policy save/set/restore that `show_modal` already does | dropped; one place owns it |
+| 14 | `passkey_unlock` (macOS) | Activated but left the process as an accessory, which cannot become active at all, so the Touch ID panel could not be frontmost; it also used the deprecated activation call directly | sets `Regular` for the duration (like `passkey_enroll`) and goes through `activate_app` (old API plus the macOS 14 `-activate`, the latter behind `respondsToSelector:`) |
+| 15 | `LockWatcher` | A bare, generic class name registered into every process that runs the session - AppKit and third-party frameworks define a lot of classes, and a collision is exactly the kind of thing that produces an obscure runtime failure | `SleeplessLockWatcher` |
+| 16 | `run()` | No trace of how far a session got: the last line was whatever had always been logged | stage lines (`Session starting`, `Stage: the black screen`, `Making one black window per display (N of them)`, `Black screen ready`, `Stage: waiting to be interrupted`) and a breadcrumb before every Objective-C step in both watchers |
+| 17 | `gui` | `path.parent().unwrap()` in the autostart files and the log-dir creation - only unreachable in practice, but a panic in the tray app takes the menu bar icon with it | guarded |
+| 18 | version strings | `Cargo.toml` said 0.3.0 while tags said v0.2.2beta*, and the log line quoted the wrong build | both packages at `0.2.2-beta.5` |
+
+| 19 | `run()` (macOS), `watch_session_locks` (Linux) | `std::thread::spawn` panics if the OS refuses to start a thread. With the black windows already up, that panic would end the process - display back, password never asked | `unix::spawn_thread` (Builder + name, returns io::Result); a missing watcher is a logged degradation, and a missing *activity* watcher releases everything and exits instead of leaving an unanswerable screen |
+| 20 | the exception handlers | installed only for the session | `install_crash_reporting()` is called from `main()` for every subcommand: the credential commands talk to AppKit (NSAlert) and LocalAuthentication too |
+
+| 21 | `unlock_loop` | If a store ever holds a passkey without a password (hand-edited, or a password cleared from another session while the screen is black), `check_password` can never succeed and the gate asks **forever** - the exact "black screen with no way back" the feature must never produce | the loop checks `has_password()` first and ends the gate (which ends the session) with a log line explaining why; tested by `the_gate_ends_when_no_password_is_enrolled` |
+
+### Second pass over the same code (what it found, and what it confirmed)
+
+- **Threading.** `release_and_exit()` only touches the `caffeinate` child and `exit(0)`; no
+  AppKit from a worker thread (which is also why the cursor unhide lives on the main-thread
+  paths and not in `release_and_exit`). The reply block of `evaluatePolicy` and the
+  distributed observer both only touch an `AtomicBool`/`AtomicU8` and the logger. The
+  `PROMPT_*` thread_locals are touched only by `show_modal` and the timer, both main thread.
+  `SleeplessLockWatcher` has no main-thread marker, so AppKit may call it anywhere; its body
+  is thread-safe.
+- **Lifetimes.** Observer tokens in `OBSERVERS`, observer objects in `WATCHERS`, the timer in
+  `PROMPT_TIMER` (invalidated when the prompt ends), the black windows held in `_windows` for
+  the whole run (dropping them early would uncover the desktop), and the `LAContext` owned by
+  the caller for the whole evaluation - Apple warns that releasing it mid-evaluation cancels
+  it.
+- **Escape hatches, branch by branch.** Gate with nothing to check -> ends (row 21). Prompt loop cancelled -> `cancelled()` -> restore
+  path; session taken -> watchdog thread (500 ms poll) or the wait loop's cancel ->
+  `release_and_exit`; prompt throws -> the process dies, the windows die with it and the
+  display comes back (deliberately *not* caught: catching `runModal` would loop forever
+  re-throwing); watcher fails -> logged and the run continues; Linux display can't be
+  controlled -> waits for Enter, or for a lock if there's no terminal; Windows overlay
+  creation fails -> falls back to the CLI dialog. Known limitation: if the screen-lock watch
+  is unavailable, `Ctrl+Cmd+Q` no longer ends the run by itself - the OS lock screen covers
+  ours, and killing the process (or the new `SLEEPLESS_NO_SCREEN_LOCK_WATCH=1`) still works.
+- **Still hand-written Objective-C after the cleanup: exactly four messages** - the three
+  below and `sel!(sleeplessSessionLockChanged:)`, which names a method we define ourselves.
+  Everything else goes through generated bindings.
+
+### Objective-C call audit (beta5)
+
+| Selector / call | Class | Verified against | ok |
+| --- | --- | --- | --- |
+| `+defaultCenter` | NSDistributedNotificationCenter | Apple docs, Foundation/DistributedNotificationCenter (class methods: `default()`, `forType(_:)`; navigatorTitles `+ defaultCenter`, `+ notificationCenterForType:`) + the archived Cocoa Fundamentals guide ("you access with the `NSDistributedNotificationCenter` class method `defaultCenter`") | yes (was `+distributedNotificationCenter`: **no**) |
+| `-downcast::<NSNotificationCenter>()` | the centre | same page: "Inherits From: NSNotificationCenter"; objc2 `Retained::downcast` performs `isKindOfClass:` at runtime | yes |
+| `-addObserver:selector:name:object:` | NSNotificationCenter (inherited) | objc2-foundation `generated/NSNotification.rs:143`, returns void | yes |
+| `-addObserverForName:object:queue:usingBlock:` | NSNotificationCenter (inherited) | objc2-foundation `generated/NSNotification.rs:210`, returns `Retained<ProtocolObject<dyn NSObjectProtocol>>`, needs features `NSNotification`/`NSOperation`/`NSString`/`block2` | yes (beta3's 5-argument `options:` variant was hand-written: **no**) |
+| `+new` | SleeplessLockWatcher (NSObject subclass) | objc2 `extern_methods!` superclass block; `msg_send!` converts the `id` return to `Retained` (`msg_send_id!` is deprecated) | yes |
+| `-respondsToSelector:` + `-activate` | NSApplication | objc2-app-kit `NSApplication.rs:569` (`pub fn activate(&self)`, no availability gate, macOS 14+ in AppKit) behind the NSObject guard | yes |
+| `-evaluatePolicy:localizedReason:reply:` | LAContext | objc2-local-authentication `LAContext.rs:301` -> **void**, block `Fn(Bool, *mut NSError)` | yes (beta2/3 read a BOOL: **no**) |
+| `-canEvaluatePolicy:error:` | LAContext | same file, line 234 -> `Result<(), Retained<NSError>>` | yes |
+| `-invalidate` | LAContext | same file, line 323 | yes |
+| `+sharedWorkspace`, `-notificationCenter` | NSWorkspace | objc2-app-kit `NSWorkspace.rs:50`, `:54` | yes |
+| `+distributedNotificationCenter` | - | does not exist anywhere | removed |
+| `+ [NSCursor hide]` / `+ [NSCursor unhide]` | NSCursor | objc2-app-kit `NSCursor.rs:130`, `:134`, class methods, void | yes (now balanced by a counter) |
+| `-runModal` | NSAlert | `NSAlert.rs:231` -> `NSModalResponse` (buttons answer 1000/1001, see the earlier gotcha) | yes |
+| `-window`, `-setAccessoryView:`, `-addButtonWithTitle:`, `-setMessageText:`, `-setInformativeText:`, `-setAlertStyle:` | NSAlert | `NSAlert.rs:287/219/139/...` | yes |
+| `-nextEventMatchingMask:untilDate:inMode:dequeue:`, `-sendEvent:`, `-setActivationPolicy:`, `-activationPolicy`, `-unhide:`, `-activateIgnoringOtherApps:` | NSApplication | `NSApplication.rs:906` (returns `Option<Retained<NSEvent>>`, `expiration: Option<&NSDate>` - nil means *block forever*), `:893`, `:752`, `:741`, `:507`, `:553` | yes (the nil-expiration use was the bug in row 5) |
+| `-setLevel:`, `-setCollectionBehavior:`, `-setFrame:display:`, `-frame`, `-title`, `-level`, `-makeKeyAndOrderFront:`, `-orderFrontRegardless`, `-makeFirstResponder:`, `-isKeyWindow`, `-setBackgroundColor:`, `-setHasShadow:`, `-setReleasedWhenClosed:` | NSWindow | `NSWindow.rs:1092/1113/952/1157/2081/972/...` | yes |
+| `+screens`, `-frame` | NSScreen / `NSArray::firstObject/iter/len` | `NSScreen.rs`, `NSArray.rs` | yes |
+| `-stringValue` | NSControl (NSSecureTextField's ancestor) | `NSControl.rs:204` -> `Retained<NSString>` | yes |
+| `-addTimer:forMode:`, `+mainRunLoop`, `+RunLoopCommonModes`, `+scheduledTimerWithTimeInterval:repeats:block:`, `-invalidate` | NSRunLoop / NSTimer | `NSRunLoop.rs:57`, `NSRunLoop.rs:20`, `NSTimer.rs:118` | yes |
+| `+dateWithTimeIntervalSinceNow:` | NSDate | `NSDate.rs` | yes |
+| `objc_setExceptionPreprocessor`, `objc_setUncaughtExceptionHandler` | libobjc (`objc-exception.h`) | objc2 `src/ffi/exception.rs:92`, `:97`; handler types `unsafe extern "C" fn(*mut AnyObject) -> *mut AnyObject` and `unsafe extern "C" fn(*mut AnyObject)`, documented as non-null parameters, available on all apple targets except 32-bit macos x86 (we ship arm64 + x86_64) | yes |
+| `-name`, `-reason`, `-isKindOfClass:` on the exception | NSException, via `objc2::exception::Exception`'s Debug impl | objc2 `src/exception.rs:160-200` (checks `isKindOfClass:` before touching `name`/`reason`) | yes |
+
+### Hazard recorded so it isn't repeated
+
+Running a bare `sleepless` on the development desktop is **not** a safe smoke test: with
+`XDG_CURRENT_DESKTOP=zorin:gnome` it picks the GNOME backend and switches the real monitor
+off (`org.gnome.Mutter.DisplayConfig PowerSaveMode 3`), restoring only if it exits cleanly.
+Unsetting `XDG_SESSION_TYPE`/`DISPLAY` does not prevent it. Smoke-test the credential
+commands (`--has-password`, `--clear-password`) instead; `timeout` around a session run
+leaves the display in whatever state the killed process left it.
+
+### Things this review could not settle without a Mac
+
+- Whether `+defaultCenter` on a process started by the tray app behaves (it is documented;
+  the crash trace proves the *class* is present and messages reach it).
+- Whether the distributed `com.apple.screenIsLocked` subscription actually fires for
+  `Ctrl+Cmd+Q` on the user's macOS version - the beta5 log will now say which observer
+  subscribed, and the new `SLEEPLESS_NO_SCREEN_LOCK_WATCH=1` switch isolates it.
+- Whether `key window: true` appears in the timer line (activation of a background process is
+  a policy the OS can refuse).
+- Whether `NSDistributedNotificationCenter` delivers to a selector observer on the run loop we
+  pump by hand (we drain events with `nextEventMatchingMask:`, not `NSApp run`).
+- The Windows and Linux changes are compile-verified and code-reviewed only; the registry
+  `RegDeleteValueW` path and the logind poller need the real machines.
+
 ## Sources
 
 - https://learn.microsoft.com/windows/win32/api/winreg/nf-winreg-regcreatekeyexw
@@ -582,3 +707,8 @@ use `LAPolicy::DeviceOwnerAuthenticationWithBiometrics`).
 - https://docs.rs/objc2/latest/objc2/exception/fn.catch.html
 - https://objc2.objcs.io/objc2/ (define_class!, msg_send! Retained conversion)
 - https://developer.apple.com/documentation/appkit/nsapplication/activate()
+- https://developer.apple.com/documentation/foundation/distributednotificationcenter (class methods +defaultCenter, +notificationCenterForType:; inherits from NSNotificationCenter)
+- https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/CocoaFundamentals/CommunicatingWithObjects/CommunicateWithObjects.html
+- https://apple.stackexchange.com/questions/159195/run-a-program-script-when-the-screen-is-locked-or-unlocked
+- https://github.com/apple-oss-distributions/objc4/blob/objc4-818.2/runtime/objc-exception.h
+- local: ~/.cargo/registry/src/*/objc2-{app-kit,foundation,local-authentication}/src/generated/*.rs and objc2-0.6.5/src/{exception.rs,ffi/exception.rs}

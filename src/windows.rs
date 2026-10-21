@@ -25,8 +25,8 @@ use windows_sys::Win32::System::Power::{
     PowerWriteACValueIndex, PowerWriteDCValueIndex,
 };
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-    KEY_READ, KEY_WRITE, REG_SZ,
+    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
+    HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_SZ,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     SendMessageW, SystemParametersInfoW, HWND_BROADCAST, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE,
@@ -124,6 +124,19 @@ pub fn init_logging(debug: bool) {
         let handle = GetStdHandle(STD_OUTPUT_HANDLE);
         let _ = CONSOLE_OUT.set(handle as isize);
     }
+}
+
+/// Bounds a character count returned by a Win32 text getter to the buffer that
+/// was handed to it.
+///
+/// `GetDlgItemTextW` documents 0 on failure but can report more characters than
+/// it actually copied when the buffer is too small; clamping is what stops that
+/// slicing past the end of the buffer. A panic there would end the process, and
+/// on the lock screen that means the desktop uncovering itself with the password
+/// never asked - the one outcome this feature exists to prevent.
+fn utf16_prefix(buf: &[u16], len: u32) -> &[u16] {
+    let len = (len as usize).min(buf.len());
+    &buf[..len]
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -286,7 +299,7 @@ thread_local! {
 fn edit_text(parent: HWND) -> String {
     let mut buf = [0u16; 512];
     let len = unsafe { GetDlgItemTextW(parent, IDC_EDIT, buf.as_mut_ptr(), buf.len() as i32) };
-    String::from_utf16_lossy(&buf[..len.min(buf.len() as u32) as usize])
+    String::from_utf16_lossy(utf16_prefix(&buf, len))
 }
 
 unsafe extern "system" fn prompt_proc(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> isize {
@@ -810,7 +823,7 @@ unsafe fn lock_overlay_ask(hwnd: HWND, status: &str) -> Option<Secret> {
     }
     let mut buf = [0u16; 512];
     let len = GetDlgItemTextW(hwnd, IDC_LOCK_EDIT, buf.as_mut_ptr(), buf.len() as i32);
-    let text = String::from_utf16_lossy(&buf[..len.min(buf.len() as u32) as usize]);
+    let text = String::from_utf16_lossy(utf16_prefix(&buf, len));
     // Never leave the attempt that just failed in the box.
     SetWindowTextW(edit, wide("").as_ptr());
     Some(Secret::new(text.trim_end()))
@@ -1106,6 +1119,10 @@ fn interruptible_sleep(ms: u32) {
     }
 }
 
+/// Nothing to install here: a Win32 failure returns an error code rather than
+/// throwing, so the panic hook in src/logging.rs is the whole story.
+pub fn install_crash_reporting() {}
+
 pub fn run(opts: crate::Options) {
     // If an earlier run was killed (which is the documented way out of the
     // lock screen), its power settings are still changed. Put them back first.
@@ -1268,7 +1285,9 @@ pub fn run(opts: crate::Options) {
                     session_was_taken,
                 );
                 unsafe { lock_overlay_free(overlay) };
-                if !unlocked {
+                if unlocked {
+                    log!("Password accepted; the lock screen comes down.");
+                } else {
                     log!("Gate ended without a password: the session was taken over.");
                 }
             }
@@ -1277,13 +1296,17 @@ pub fn run(opts: crate::Options) {
             // dialog rather than letting the session end unasked.
             None => {
                 log!("No lock screen window; asking through the password dialog instead.");
-                lock::unlock_loop(
+                let unlocked = lock::unlock_loop(
                     |message| prompt_secret("Sleepless", message),
                     session_was_taken,
                 );
+                if unlocked {
+                    log!("Password accepted.");
+                } else {
+                    log!("Gate ended without a password: the session was taken over.");
+                }
             }
         }
-        log!("Password accepted.");
     }
 
     log!("Restoring original power settings...");
@@ -1323,8 +1346,16 @@ pub fn run(opts: crate::Options) {
         );
     }
     if let Some(hkey) = open_desktop_key(KEY_WRITE) {
-        if let Some(path) = &original_screensaver {
-            write_string_value(hkey, "SCRNSAVE.EXE", path);
+        match &original_screensaver {
+            Some(path) => write_string_value(hkey, "SCRNSAVE.EXE", path),
+            // There was no screensaver chosen before us, so "restoring" means
+            // removing the one we pointed at - leaving it would quietly enable
+            // the blank saver for the user for good.
+            None => {
+                let name_w = wide("SCRNSAVE.EXE");
+                let result = unsafe { RegDeleteValueW(hkey, name_w.as_ptr()) };
+                log!("No screensaver was set before: removed SCRNSAVE.EXE (result {result}).");
+            }
         }
         unsafe { RegCloseKey(hkey) };
     }

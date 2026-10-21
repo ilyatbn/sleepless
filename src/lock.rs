@@ -254,6 +254,18 @@ pub fn unlock_loop(
     let mut backoff = Backoff::default();
     let mut message = "Enter your password to come back";
     loop {
+        // Nothing to check: with a passkey enrolled but no password (only
+        // reachable by editing the store, or by clearing the password while the
+        // screen is black) asking forever would trap the user behind a prompt
+        // that can never be satisfied. Ending the gate ends the session, which
+        // is the safe direction: nothing is let through, and nothing is stuck.
+        if !has_password() {
+            log!(
+                "The gate is armed but no password is enrolled, so there is nothing to check: \
+                 ending the session instead of asking forever."
+            );
+            return false;
+        }
         // The OS taking the session over must always get us out of here, even
         // if our own prompt is wedged: that's the documented safety valve.
         if cancelled() {
@@ -454,6 +466,23 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0], "Enter your password to come back");
         assert_eq!(messages[1], "Wrong password, try again");
+    }
+
+    /// A gate with nothing to check must end rather than ask forever - the
+    /// difference between a stuck black screen and a session that lets go.
+    #[test]
+    fn the_gate_ends_when_no_password_is_enrolled() {
+        let _store = TempStore::new("unlockempty");
+        let asked = std::cell::Cell::new(0usize);
+        let unlocked = unlock_loop(
+            |_| {
+                asked.set(asked.get() + 1);
+                Some(Secret::new("anything"))
+            },
+            || false,
+        );
+        assert!(!unlocked, "an unsatisfiable gate must not report success");
+        assert_eq!(asked.get(), 0, "and it must not ask at all");
     }
 
     /// The OS taking the session over has to interrupt the gate even when the

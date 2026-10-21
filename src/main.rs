@@ -143,6 +143,7 @@ fn main() {
     let opts = parse_args();
     platform::init_logging(opts.debug);
     logging::install_panic_hook();
+    platform::install_crash_reporting();
     DEBUG.store(opts.debug, Ordering::Relaxed);
     log!(
         "Sleepless {} starting (pid {}), args {args:?}, options: {opts:?}; logging to {:?}",

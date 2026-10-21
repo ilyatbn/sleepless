@@ -176,7 +176,10 @@ mod imp {
 "#,
             exe = xml_escape(&exe.display().to_string())
         );
-        fs::create_dir_all(path.parent().unwrap())?;
+        fs::create_dir_all(
+            path.parent()
+                .ok_or_else(|| io::Error::other("no directory for the autostart file"))?,
+        )?;
         fs::write(&path, plist)
     }
 }
@@ -235,7 +238,10 @@ mod imp {
              X-GNOME-Autostart-enabled=true\n",
             exec_quote(&exe.display().to_string())
         );
-        fs::create_dir_all(path.parent().unwrap())?;
+        fs::create_dir_all(
+            path.parent()
+                .ok_or_else(|| io::Error::other("no directory for the autostart file"))?,
+        )?;
         fs::write(&path, entry)
     }
 }

@@ -137,6 +137,41 @@ Driving a prompt-driven CLI command without a GUI:
   that loop. An accessory process can't become active either, so a dialog needs
   `setActivationPolicy:Regular` (and both `activateIgnoringOtherApps:`, which macOS 14 may
   ignore, and `-activate`, which doesn't exist before 14 - hence `respondsToSelector:`).
+- **Never guess an Objective-C selector.** `NSDistributedNotificationCenter` has
+  `+defaultCenter` (and `+notificationCenterForType:`), *not* `+distributedNotificationCenter`
+  - sending the invented one gave `doesNotRecognizeSelector:` -> an `NSException` -> SIGABRT,
+  twice, and it cost two releases. Check the class in Apple's docs (the JSON behind a docs
+  page is fetchable: `https://developer.apple.com/tutorials/data/documentation/<framework>/<page>.json`
+  - it lists `relationshipsSections` including "Inherits From", which is how the
+  `NSNotificationCenter` superclass was confirmed), and cross-check the method names against
+  the generated bindings under `~/.cargo/registry/src/*/objc2-*/src/generated/`.
+- **`panic = "abort"` and Objective-C exceptions do not mix.** With abort every Rust frame is
+  nounwind, so a thrown exception cannot reach a `@catch` - not even one inside
+  `objc2::exception::catch` (whose crate carries a "test this with panic=abort" TODO) - and the
+  crash report shows only `panic in a function that cannot unwind`. The release profile
+  unwinds now; that is what makes the guards meaningful.
+- Both binaries install, on macOS, `objc_setExceptionPreprocessor` (logs the exception's class,
+  name and reason the moment it is thrown, before unwinding) and
+  `objc_setUncaughtExceptionHandler` (logs on the way out), through `objc2::ffi`. With the panic
+  hook that means: any death leaves a name in the log. Reachable via
+  `platform::install_crash_reporting()`, called from `main()` for every subcommand.
+- `nextEventMatchingMask:untilDate:inMode:dequeue:` with `untilDate: nil` **blocks until an
+  event arrives for this app**. A black-screen session is usually not the active app, so its
+  queue can stay empty while the user types: flags set by other threads are then never seen.
+  Always pass a short `NSDate`.
+- `NSCursor`'s `hide`/`unhide` are counted by AppKit, so they must be balanced; keep a flag
+  rather than calling `unhide` blindly. And a hidden cursor over a lock screen means the user
+  cannot see the pointer for the password box - or for Apple's Touch ID panel buttons.
+- `GetDlgItemTextW` (and friends) return a count that should be clamped to the buffer before
+  slicing: `utf16_prefix`. A slice past the end panics, and on the Windows lock screen a panic
+  kills the process - uncovering the desktop with the password never asked.
+- `catch-objc-exceptions` is enabled **only** in the macOS CI job (see the earlier bullet on
+  the Objective-C compiler); without it `try_objc` is a pass-through, so the exception
+  handlers above are what make a failure readable.
+- Escape hatches to keep in mind when changing any of this: nothing may leave the black screen
+  up with no prompt - the gate is cancellable by the session-taken flag, the main loop wakes on
+  a timer rather than on events alone, a dying process always removes the windows, and
+  `SLEEPLESS_NO_SCREEN_LOCK_WATCH=1` disables the riskiest watcher.
 - With `panic = "abort"` in the release profile a panic leaves the log ending mid-sentence
   and looks like a killed process. `logging::install_panic_hook()` writes
   `PANIC at file:line: message` straight to the log file (not through the normal sink, whose
@@ -166,6 +201,12 @@ Driving a prompt-driven CLI command without a GUI:
 - Tests: the store location is an environment variable, so the test helper takes a process
  -wide lock. Without it, two tests switch the directory under each other and an "ask until
   correct" loop never terminates - which looks like a hung test suite, not a broken test.
+- Don't smoke-test a session on the development desktop: the Linux backend detects the real
+  GNOME session and turns the actual monitor off, restoring only on a clean exit. Test the
+  credential commands instead.
+- `std::thread::spawn` panics on failure; on a locked screen that is the difference between
+  "the prompt is up" and "the desktop is uncovered". Use `unix::spawn_thread`, which returns
+  `io::Result` and is logged.
 - Cap test runs: `timeout 60 cargo test`; bisect a hang with `cargo test <name>`.
 
 ## Releasing
