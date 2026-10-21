@@ -7,6 +7,12 @@ edition = "2021"
 name = "sleepless-gui"
 path = "src/main.rs"
 
+[features]
+# Same as in the main crate: catching an Objective-C exception means compiling a
+# small helper (objc2-exception-helper) for the target, which a cross-build from
+# Linux can't do. The macOS CI job turns it on for both binaries.
+catch-objc-exceptions = ["objc2/exception"]
+
 [dependencies]
 # Linux uses the pure D-Bus StatusNotifierItem backend (ksni) instead of
 # the default GTK/AppIndicator one, so there are no system libraries to
@@ -39,14 +45,31 @@ objc2 = "0.6"
 # be probed without a hand-written msg_send! signature.
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
+    "NSDate",
+    "NSError",
+    # -runMode:beforeDate: is gated behind this (its mode argument is a
+    # validated NSString wrapper).
+    "NSObjCRuntime",
     "NSObject",
+    "NSGeometry",
+    "NSRunLoop",
+    "NSString",
+] }
+# block2 + local-authentication: the Touch ID prompt is asked here, in the app
+# the user just clicked, because a CLI child of a GUI app can't be activated.
+block2 = "0.6"
+objc2-local-authentication = { version = "0.3", default-features = false, features = [
+    "LAContext",
+    "block2",
 ] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
+    "NSAlert",
     "NSApplication",
+    "NSControl",
+    "NSEvent",
     "NSResponder",
-    # +runningApplicationWithProcessIdentifier: is behind the crate's "libc"
-    # feature (its argument is pid_t).
-    "NSRunningApplication",
-    "libc",
+    "NSView",
+    "NSWindow",
+    "NSSecureTextField",
 ] }

@@ -21,22 +21,24 @@
 // Action (right-click > Quick Actions > "Sleepless as root") into
 // ~/Library/Services.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
+use std::io::Write;
 use std::path::Path;
 use std::process::Child;
+use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{env, fs, io, thread};
 
 use objc2::rc::Retained;
 use objc2::ClassType;
-use objc2::{MainThreadMarker, MainThreadOnly};
+use objc2::MainThreadMarker;
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSApplicationActivationOptions,
-    NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSCursor, NSEvent, NSEventMask,
-    NSModalResponse, NSRunningApplication, NSScreen, NSSecureTextField, NSWindow,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
+    NSBackingStoreType, NSColor, NSCursor, NSEvent, NSEventMask, NSFont, NSRunningApplication,
+    NSScreen, NSSecureTextField, NSTextField, NSWindow, NSWindowCollectionBehavior,
+    NSWindowStyleMask,
 };
 use objc2_foundation::NSDefaultRunLoopMode;
 
@@ -132,7 +134,7 @@ fn install_quick_actions() {
 
 /// Puts a black, borderless window over every display. They stay up until
 /// the process exits.
-fn black_out(mtm: MainThreadMarker) -> Vec<Retained<NSWindow>> {
+fn black_out(mtm: MainThreadMarker) -> Vec<Retained<SleeplessBlackWindow>> {
     let app = NSApplication::sharedApplication(mtm);
     // No Dock icon, but still able to come to the front, so the keypress
     // that brings you back lands here rather than in whatever app was
@@ -147,14 +149,12 @@ fn black_out(mtm: MainThreadMarker) -> Vec<Retained<NSWindow>> {
         .iter()
         .map(|screen| {
             let frame = screen.frame();
-            let window = unsafe {
-                NSWindow::initWithContentRect_styleMask_backing_defer(
-                    NSWindow::alloc(mtm),
-                    frame,
-                    NSWindowStyleMask::Borderless,
-                    NSBackingStoreType::Buffered,
-                    false,
-                )
+            // Key-capable on purpose: this same window hosts the password box
+            // when the user comes back.
+            let window = match unsafe { try_objc(|| black_window(frame)) } {
+                Ok(Some(window)) => window,
+                Ok(None) => fail("could not create a black window"),
+                Err(why) => fail(&format!("could not create a black window: {why}")),
             };
             unsafe { window.setReleasedWhenClosed(false) };
             // Explicit, because the alternative is a "black screen" that
@@ -202,147 +202,42 @@ fn sleep_disabled() -> Option<bool> {
 // ---------------------------------------------------------------------
 // Asking for the credential
 //
-// An NSAlert with a secure text field as its accessory view: the alert's own
-// buttons run the modal loop, so Return accepts and Escape cancels without us
-// having to look at key events, and the field never echoes what's typed.
+// There is no dialog here at all. An enrolment dialog shown by this process is
+// shown by a background command-line child, and since macOS 14 activation is
+// cooperative: the system decides, and it does not hand focus to a child process
+// while the user is typing in Terminal. beta3 through beta5 tried to force it -
+// activation-policy flips, a twice-a-second `activate`, window-level games - and
+// the result was a panel that was on screen at the right frame and invisible,
+// with the user's focus being dragged back every other tick.
+//
+// So: the credential prompts a *person* answers live in the tray app
+// (sleepless-gui, which is the app the user just clicked, `gui/src/enrol.rs`),
+// and this process reads from the terminal, which is what someone running
+// `sleepless --set-password` by hand or over ssh wants anyway.
 // ---------------------------------------------------------------------
 
 use crate::lock::{self, Secret};
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
-/// Puts a window above this app's black windows (which sit at the screensaver
-/// level) and makes it follow the user across spaces, so a dialog is never
-/// underneath the very thing it is supposed to be drawn on top of.
-fn raise_above_black_out(window: &NSWindow) {
-    window.setLevel(SCREEN_SAVER_WINDOW_LEVEL + 1);
-    window.setCollectionBehavior(
-        NSWindowCollectionBehavior::CanJoinAllSpaces
-            | NSWindowCollectionBehavior::Stationary
-            | NSWindowCollectionBehavior::FullScreenAuxiliary
-            | NSWindowCollectionBehavior::IgnoresCycle,
-    );
-}
-
-/// Builds the alert and its secure field, shared by the enrolment prompt and
-/// the lock screen. Without a cancel button there is no way out of the lock
-/// screen except typing the password.
-fn secret_alert(
-    mtm: MainThreadMarker,
-    title: &str,
-    message: &str,
-    cancel_button: bool,
-) -> (Retained<NSAlert>, Retained<NSSecureTextField>) {
-    let alert = NSAlert::new(mtm);
-    alert.setAlertStyle(NSAlertStyle::Warning);
-    alert.setMessageText(&NSString::from_str(message));
-    // The first button is the default one, so Return is what submits it.
-    alert.addButtonWithTitle(&NSString::from_str(if cancel_button {
-        "OK"
-    } else {
-        "Come back"
-    }));
-    if cancel_button {
-        alert.addButtonWithTitle(&NSString::from_str("Cancel"));
-    }
-
-    let field = NSSecureTextField::new(mtm);
-    field.setFrame(NSRect::new(
-        NSPoint::new(0.0, 0.0),
-        NSSize::new(280.0, 24.0),
-    ));
-    alert.setAccessoryView(Some(&field));
-
-    let window = alert.window();
-    window.setTitle(&NSString::from_str(title));
-    window.makeFirstResponder(Some(&field));
-    (alert, field)
-}
-
-/// NSAlert's buttons answer with NSAlertFirstButtonReturn (1000) / Second (1001)
-/// / Third (1002), numbered by the order they were added - *not* with
-/// NSModalResponseOK (1), which is what a hand-rolled modal window uses.
-/// NSModalResponseAbort means the alert was dismissed another way (Escape, the
-/// close box). Comparing against NSModalResponseOK made every button look like a
-/// cancellation, which is exactly the "cancelled: no password was set" symptom.
-/// The test below pins the numbers.
-pub fn accepted(answer: NSModalResponse) -> bool {
-    answer == NSAlertFirstButtonReturn
-}
-
-/// Reads the field out of a finished secret alert, logging what the user
-/// actually pressed so a device report can tell "cancelled" from "wrong API".
-fn secret_from(field: &NSSecureTextField, answer: NSModalResponse, where_: &str) -> Option<Secret> {
-    log!(
-        "{where_}: alert response {answer} -> {}.",
-        if accepted(answer) {
-            "accepted"
-        } else {
-            "not accepted"
-        }
-    );
-    accepted(answer).then(|| Secret::new(field.stringValue().to_string().trim_end()))
-}
-
-/// Asks for a secret. None when the user cancelled.
-pub fn prompt_secret(title: &str, message: &str) -> Option<Secret> {
-    let Some(mtm) = MainThreadMarker::new() else {
-        log!("prompt_secret: not on the main thread, cannot show a dialog.");
-        return None;
-    };
-    log!("Showing the password dialog: {title} / {message}");
-    // show_modal handles activation and the activation policy for us.
-    let (alert, field) = secret_alert(mtm, title, message, true);
-    // Not the lock screen: no policy flip, no timer, no Dock icon.
-    let answer = show_modal(&alert, mtm, false);
-    secret_from(&field, answer, "password dialog")
-}
-
-/// The lock screen's prompt: the same field, but raised above the black
-/// windows, on the display the pointer is on, with the app activated, and with
-/// no Cancel button.
-///
-/// All of that matters: a beta left the prompt underneath the black windows,
-/// which looked exactly like a machine that wouldn't wake up. The repeating
-/// timer below keeps re-asserting it, because AppKit's modal loop runs in its
-/// own run-loop mode and something else can end up on top meanwhile.
-fn prompt_secret_locked(title: &str, message: &str) -> Option<Secret> {
-    let Some(mtm) = MainThreadMarker::new() else {
-        log!("prompt_secret_locked: not on the main thread, cannot show a prompt.");
-        return None;
-    };
-    // The pointer has to be visible for this: it's the one thing on the black
-    // screen the user might want to point at, and beta3's report of "no prompt
-    // anywhere" was helped by there being no cursor to see either.
-    show_cursor();
-    let (alert, field) = secret_alert(mtm, title, message, false);
-    let answer = show_modal(&alert, mtm, true);
-    // Back to black between attempts.
-    hide_cursor();
-    secret_from(&field, answer, "lock screen prompt")
-}
-
-/// Asks once for this process to become the active app.
+/// Asks **once** for this process to become the active app.
 ///
 /// Three ways, because macOS 14 changed the rules and we still run on older
-/// ones: the deprecated forceful call (honoured before 14), the
-/// `NSRunningApplication` one (with `ActivateAllWindows` only - the
-/// `ActivateIgnoringOtherApps` *option* is documented as having no effect since
-/// 14), and 14's cooperative `-activate`, which exists only there and so is
-/// behind `respondsToSelector:` (calling a method the system doesn't have is an
-/// unrecognized-selector exception, and that cost two betas already).
+/// ones: the deprecated forceful call (still honoured there),
+/// `NSRunningApplication::activateWithOptions(ActivateAllWindows)` - only that
+/// option, since the `ActivateIgnoringOtherApps` *option* is documented to have
+/// no effect since 14 - and 14's cooperative `-activate`, which exists only on 14
+/// and so sits behind `respondsToSelector:` (sending a method the system doesn't
+/// have is an unrecognized-selector exception, and that cost two betas already).
 ///
-/// It must be called *once*, before entering the modal loop. beta5 called it
-/// twice a second from the keep-on-top timer: cooperative activation is only a
-/// request, the system granted and withdrew it in turn, and the enrolment dialog
-/// spent two minutes flickering between visible and hidden while stealing focus
-/// from Terminal - `key window: true/false` flipping every tick in the log is
-/// exactly that fight.
+/// Once, never in a poll loop: cooperative activation is a request the system may
+/// grant or withdraw, and beta5 asked twice a second, which is what made the key
+/// window flap and dragged focus back from the user's terminal.
 fn activate_app(app: &NSApplication) {
     #[allow(deprecated)] // the pre-14 way; still accepted there
     app.activateIgnoringOtherApps(true);
     let me = NSRunningApplication::currentApplication();
     let forced = me.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
-    // Typed (NSObjectProtocol), so there is no hand-written signature here.
+    // Typed (NSObjectProtocol): no hand-written signature to get wrong.
     let responds = app.respondsToSelector(sel!(activate));
     let cooperated = if responds {
         app.activate();
@@ -356,282 +251,519 @@ fn activate_app(app: &NSApplication) {
     );
 }
 
-/// Shows an alert modally and keeps it where the user can actually see it: the
-/// app activated, the panel raised above everything this app puts on screen
-/// (including the lock screen's own black windows), centred on the display the
-/// pointer is on, and re-asserted twice a second while it's up.
-///
-/// Every dialog goes through here. A beta left the lock screen's password box
-/// underneath the black windows, which looked exactly like a machine that
-/// wouldn't wake up, and an enrolment dialog started while a session is running
-/// would be hidden the same way - the black windows are at the screensaver
-/// level, so an ordinary panel can never reach them.
-/// Shows an alert modally.
-///
-/// `at_the_lock_screen` is what separates the two situations this has to serve:
-///
-/// - **an ordinary dialog** (enrolment, a report, a confirmation): activate once,
-///   show it, and then leave the user's focus alone. There is nothing to fight
-///   for - the desktop is right there, and the app the user is typing into is
-///   theirs. beta5 kept fighting twice a second and the dialog came out
-///   invisible: the panel was hidden every time the system deactivated us, and
-///   shown again when it let us activate, which is the flicker and the focus
-///   stealing in the log.
-/// - **the lock screen's password box**: this process owns the whole screen at
-///   that point (the black windows are at the screensaver level), so it has to
-///   keep the box above them and keep it key, which is what the timer is for -
-///   and only for that case.
-fn show_modal(alert: &NSAlert, mtm: MainThreadMarker, at_the_lock_screen: bool) -> NSModalResponse {
-    let app = NSApplication::sharedApplication(mtm);
-    // Regular policy only at the lock screen, and only while the box is up: with
-    // black windows covering everything the Dock icon can't be seen anyway, and
-    // an accessory app that the system won't let become active can't have a key
-    // window - so the box couldn't take typing. For every other dialog the
-    // process keeps the policy it started with, which is what beta3 did and what
-    // keeps a Dock icon from appearing while someone enrols a password.
-    let policy = at_the_lock_screen.then(|| {
-        let previous = app.activationPolicy();
-        app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
-        previous
-    });
-
-    let window = alert.window();
-    // The single most likely reason a dialog of ours can be on screen, at the
-    // right level, at the right frame, and still not be seen: NSAlert's window
-    // is an NSPanel, and panels default to `hidesOnDeactivate = YES`. A process
-    // the system deactivates (which is what happens when the user is typing in
-    // Terminal) then hides its own panel, and it stays hidden until something
-    // makes the app active again.
-    window.setHidesOnDeactivate(false);
-    raise_above_black_out(&window);
-    let where_ = centre_on_cursor_display(&window, mtm);
-    activate_app(&app);
-    window.makeKeyAndOrderFront(None);
-    if at_the_lock_screen {
-        keep_prompt_on_top(&window);
+/// Asks for a secret in the terminal, echoing nothing. None if there's no
+/// terminal or the user cancelled.
+pub fn prompt_secret_interactive(_title: &str, message: &str) -> Option<Secret> {
+    if !unix::has_tty() {
+        log!("No terminal to ask in, and this process shows no dialog: use the menu bar, or --stdin.");
+        eprintln!(
+            "Sleepless: there's no terminal here to type a password into.\n\
+             Use the menu-bar icon, or pipe the password in with `--set-password --stdin`."
+        );
+        return None;
     }
-    let frame = window.frame();
-    // Key state is not meaningful here: a panel becomes key inside the modal
-    // loop, so it is false at this point even when everything works. The timer
-    // reports it from inside the loop when there is a timer; for the plain
-    // dialog this line plus the alert's own response code is the record.
-    log!(
-        "Dialog {:?} shown {where_}: level {}, frame ({}, {}, {}x{}), hidesOnDeactivate {}, \
-         visible {}, occlusion {:?}, app active {}, timer {}.",
-        window.title().to_string(),
-        window.level(),
-        frame.origin.x,
-        frame.origin.y,
-        frame.size.width,
-        frame.size.height,
-        window.hidesOnDeactivate(),
-        window.isVisible(),
-        window.occlusionState(),
-        app.isActive(),
-        at_the_lock_screen
-    );
-    let answer = alert.runModal();
-    if at_the_lock_screen {
-        stop_keeping_prompt_on_top();
+    // Same trick the Linux backend uses: stty turns echo off, so what's typed
+    // doesn't appear on screen; put it back however it was afterwards.
+    let echo_off = std::process::Command::new("stty")
+        .args(["-echo"])
+        .status()
+        .is_ok_and(|s| s.success());
+    eprint!("{message} ");
+    let _ = <io::Stderr as io::Write>::flush(&mut io::stderr());
+    let mut line = String::new();
+    let read = io::stdin().read_line(&mut line);
+    if echo_off {
+        let _ = std::process::Command::new("stty").args(["echo"]).status();
     }
-    if let Some(policy) = policy {
-        app.setActivationPolicy(policy);
+    eprintln!();
+    match read {
+        Ok(n) if n > 0 => Some(Secret::new(line.trim_end_matches(['\n', '\r']))),
+        _ => None,
     }
-    answer
 }
 
-// The prompt window, where the keep-on-top timer can reach it (both run on
-// the main thread).
-thread_local! {
-    static PROMPT_WINDOW: RefCell<Option<Retained<NSWindow>>> = const { RefCell::new(None) };
-    static PROMPT_TIMER: RefCell<Option<Retained<NSTimer>>> = const { RefCell::new(None) };
-    // What the timer has seen, so it can report the interesting transitions
-    // instead of twice a second the same thing.
-    static PROMPT_TICKS: Cell<u32> = const { Cell::new(0) };
-    static PROMPT_KEY: Cell<bool> = const { Cell::new(false) };
-    // Which tick last asked for activation, so the ask is rate limited: with a
-    // start value of 0 the first re-activation happens two seconds in (four
-    // ticks), by which point show_modal's own single ask has had time to land.
-    static PROMPT_LAST_ACTIVATE: Cell<u32> = const { Cell::new(0) };
-}
-
-/// Puts the prompt on the display the pointer is on, centred. Without this it
-/// lands on the main display, which with more than one monitor can be the one
-/// nobody is looking at.
-fn centre_on_cursor_display(window: &NSWindow, mtm: MainThreadMarker) -> String {
-    let cursor = NSEvent::mouseLocation();
-    let screens = NSScreen::screens(mtm);
-    let inside = |frame: NSRect| {
-        cursor.x >= frame.origin.x
-            && cursor.x < frame.origin.x + frame.size.width
-            && cursor.y >= frame.origin.y
-            && cursor.y < frame.origin.y + frame.size.height
-    };
-    let mut chosen = None;
-    let mut names = Vec::new();
-    for screen in screens.iter() {
-        let frame = screen.frame();
-        names.push(format!(
-            "{}x{}@{},{}",
-            frame.size.width, frame.size.height, frame.origin.x, frame.origin.y
-        ));
-        if chosen.is_none() && inside(frame) {
-            chosen = Some(frame);
-        }
-    }
-    let Some(frame) = chosen.or_else(|| screens.firstObject().map(|s| s.frame())) else {
-        return "no display found; leaving the prompt where AppKit put it".to_string();
-    };
-    let size = window.frame().size;
-    let origin = NSPoint::new(
-        frame.origin.x + (frame.size.width - size.width) / 2.0,
-        frame.origin.y + (frame.size.height - size.height) / 2.0,
-    );
-    window.setFrame_display(NSRect::new(origin, size), true);
-    format!("on the display under the pointer ({})", names.join(", "))
-}
-
-/// Re-asserts the prompt's level, brings it to the front and re-activates the
-/// app, twice a second, until the prompt is finished.
-fn keep_prompt_on_top(window: &Retained<NSWindow>) {
-    PROMPT_WINDOW.with(|slot| *slot.borrow_mut() = Some(window.clone()));
-    PROMPT_TICKS.set(0);
-    PROMPT_KEY.set(false);
-    PROMPT_LAST_ACTIVATE.set(0);
-    let block = RcBlock::new(|_timer: NonNull<NSTimer>| {
-        PROMPT_WINDOW.with(|slot| {
-            let Some(window) = slot.borrow().clone() else {
-                return;
-            };
-            let tick = PROMPT_TICKS.get();
-            PROMPT_TICKS.set(tick + 1);
-            let key = window.isKeyWindow();
-            let was = PROMPT_KEY.get();
-
-            if tick == 0 {
-                // The state that actually decides whether the user can see and
-                // type into the box, taken while the modal loop is running.
-                if let Some(mtm) = MainThreadMarker::new() {
-                    log!(
-                        "Lock prompt in its modal loop: level {}, key window: {key}, visible {}, hidesOnDeactivate {}, occlusion {:?}, app active {}.",
-                        window.level(),
-                        window.isVisible(),
-                        window.hidesOnDeactivate(),
-                        window.occlusionState(),
-                        NSApplication::sharedApplication(mtm).isActive()
-                    );
-                }
-            }
-
-            if !key {
-                // Lost key: raise and take it back. Not just ordered front -
-                // keystrokes go to whatever window the system decided is key.
-                raise_above_black_out(&window);
-                window.makeKeyAndOrderFront(None);
-                // Re-activating is the part the OS can refuse, and beta5's
-                // twice-a-second asking is what made focus flap. At most once
-                // every two seconds, and only while the box isn't key.
-                if tick.saturating_sub(PROMPT_LAST_ACTIVATE.get()) >= 4 {
-                    PROMPT_LAST_ACTIVATE.set(tick);
-                    if let Some(mtm) = MainThreadMarker::new() {
-                        log!("Lock prompt is not key; asking for activation again (tick {}).", tick + 1);
-                        activate_app(&NSApplication::sharedApplication(mtm));
-                    }
-                }
-            }
-
-            if tick == 0 || key != was {
-                PROMPT_KEY.set(key);
-                log!(
-                    "Dialog visible in its modal loop (tick {}): level {}, key window: {key}.",
-                    tick + 1,
-                    window.level()
-                );
-            }
-        });
-    });
-    let timer = unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.5, true, &block) };
-    // The alert's modal loop runs in NSModalPanelRunLoopMode, so the timer has
-    // to be registered for every common mode to fire at all.
-    unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes) };
-    PROMPT_TIMER.with(|slot| *slot.borrow_mut() = Some(timer));
-}
-
-fn stop_keeping_prompt_on_top() {
-    PROMPT_TIMER.with(|slot| {
-        if let Some(timer) = slot.borrow_mut().take() {
-            timer.invalidate();
-        }
-    });
-    PROMPT_WINDOW.with(|slot| *slot.borrow_mut() = None);
-}
-
-/// One-line result message for the credential commands.
+/// One-line result message. Printed, not popped up: whoever started this process
+/// (the tray app, a terminal, ssh) is the one that can show it.
 pub fn report(message: &str) {
     log!("Report to the user: {}", message.replace('\n', " "));
-    notify("Sleepless", message);
+    for line in message.lines() {
+        eprintln!("Sleepless: {line}");
+    }
+    let _ = io::stderr().flush();
 }
 
-/// Enrolment asks through the same dialog: there's no terminal path here.
-pub fn prompt_secret_interactive(title: &str, message: &str) -> Option<Secret> {
-    prompt_secret(title, message)
-}
-
-pub fn notify(title: &str, message: &str) {
-    let Some(mtm) = MainThreadMarker::new() else {
-        eprintln!("Sleepless: {message}");
-        return;
-    };
-    let alert = NSAlert::new(mtm);
-    alert.setMessageText(&NSString::from_str(title));
-    alert.setInformativeText(&NSString::from_str(message));
-    alert.addButtonWithTitle(&NSString::from_str("OK"));
-    show_modal(&alert, mtm, false);
-}
-
-pub fn ask_yes_no(title: &str, message: &str) -> bool {
-    let Some(mtm) = MainThreadMarker::new() else {
+/// Yes/no from the terminal. With no terminal, no: nothing asked it.
+pub fn ask_yes_no(_title: &str, message: &str) -> bool {
+    if !unix::has_tty() {
+        log!("No terminal to ask {message:?} in; taking that as no.");
         return false;
-    };
-    let alert = NSAlert::new(mtm);
-    alert.setMessageText(&NSString::from_str(title));
-    alert.setInformativeText(&NSString::from_str(message));
-    // The first button is the default one, so it's what Return gives us.
-    alert.addButtonWithTitle(&NSString::from_str("Yes"));
-    alert.addButtonWithTitle(&NSString::from_str("No"));
-    let answer = show_modal(&alert, mtm, false);
-    log!(
-        "Confirmation dialog {title:?}: response {answer} -> {}.",
-        if accepted(answer) { "yes" } else { "no" }
-    );
-    accepted(answer)
+    }
+    eprint!("{message} [y/N] ");
+    let _ = <io::Stderr as io::Write>::flush(&mut io::stderr());
+    let mut answer = String::new();
+    let _ = io::stdin().read_line(&mut answer);
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
-/// Runs AppKit's event queue by hand until `stop` says so.
+// ---------------------------------------------------------------------
+// The lock screen: the password box lives *in* the black window
+//
+// A borderless NSWindow answers NO to canBecomeKeyWindow, which is why an earlier
+// design layered a separate panel on top of the black windows and then had to
+// fight to keep that panel key and visible. The fight is what broke: a panel
+// above windows at the screensaver level, in a process the system keeps
+// deactivating, is exactly the situation where it ends up invisible.
+//
+// So the black window is a subclass that can be key, and the secure text field,
+// the question and the status line are subviews of it. Nothing is layered above
+// the black windows, so nothing can be hidden behind them. Keyboard input comes
+// to the field the ordinary way, and Return / keypad-Enter / Escape are picked up
+// by one local event monitor - which only ever runs while this box is on screen.
+// ---------------------------------------------------------------------
+
+// A unique class name: registering something generic into a process that loads
+// AppKit is a collision waiting to happen.
+define_class!(
+    #[unsafe(super(NSWindow))]
+    struct SleeplessBlackWindow;
+
+    impl SleeplessBlackWindow {
+        // A borderless window answers NO to this by default, which is why the
+        // field could never be typed into without the subclass.
+        #[unsafe(method(canBecomeKeyWindow))]
+        fn can_become_key_window(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(canBecomeMainWindow))]
+        fn can_become_main_window(&self) -> bool {
+            true
+        }
+    }
+);
+
+/// Makes one black window.
 ///
-/// `NSApplication::run()` would do this, but it never gives us a chance to
-/// notice that the thread watching for input saw the user come back, and the
-/// password prompt has to be shown on the main thread.
-fn pump_events_until(mtm: MainThreadMarker, stop: impl Fn() -> bool) {
+/// Two hand-written messages, and the reason is that a class defined at runtime
+/// has no generated constructor for its own type: `+alloc` and
+/// `-initWithContentRect:styleMask:backing:defer:` are Apple's documented ones
+/// (the typed NSWindow binding is `NSWindow.rs:570`), the argument types are
+/// taken straight from that declaration, and the result is *checked* with a
+/// runtime downcast instead of asserted. A failed init returns nil, which is why
+/// the return type is `Option`.
+///
+/// # Safety
+///
+/// Sends Objective-C messages.
+unsafe fn black_window(frame: NSRect) -> Option<Retained<SleeplessBlackWindow>> {
+    let alloced: *mut AnyObject = msg_send![SleeplessBlackWindow::class(), alloc];
+    if alloced.is_null() {
+        log!("Black window: +alloc returned nil.");
+        return None;
+    }
+    let init: *mut AnyObject = msg_send![
+        alloced,
+        initWithContentRect: frame,
+        styleMask: NSWindowStyleMask::Borderless,
+        backing: NSBackingStoreType::Buffered,
+        defer: false,
+    ];
+    let Some(window) = Retained::retain(init) else {
+        log!("Black window: -initWithContentRect:styleMask:backing:defer: returned nil.");
+        return None;
+    };
+    window.downcast::<SleeplessBlackWindow>().ok()
+}
+
+/// The widgets of the password box, and what the user did with them. Main
+/// thread only, like everything here: the event monitor and the field editor
+/// both run where events are dispatched.
+struct GateBox {
+    window: Retained<SleeplessBlackWindow>,
+    field: Retained<NSSecureTextField>,
+    status: Retained<NSTextField>,
+    monitor: Retained<AnyObject>,
+}
+
+thread_local! {
+    static GATE_BOX: RefCell<Option<GateBox>> = const { RefCell::new(None) };
+    // What the last key press did: filled in by the event monitor, taken by
+    // `wait_for_submit`. `Entered` carries what was typed.
+    static GATE_KEY: RefCell<GateKey> = const { RefCell::new(GateKey::Nothing) };
+}
+
+enum GateKey {
+    Nothing,
+    Entered(Secret),
+    Escaped,
+}
+
+const KEY_RETURN: u16 = 36;
+const KEY_PAD_ENTER: u16 = 76;
+const KEY_ESCAPE: u16 = 53;
+
+/// Which black window gets the password box: the one under the pointer, so the
+/// question is where the user is looking. Falls back to the first window when the
+/// pointer is somehow outside them all.
+///
+/// The right and top edges are exclusive, which is how AppKit tiles displays: a
+/// point exactly on the shared edge belongs to the display on the left.
+fn pick_box_window(frames: &[NSRect], cursor: NSPoint) -> usize {
+    let mut chosen = 0usize;
+    for (index, frame) in frames.iter().enumerate() {
+        let inside = cursor.x >= frame.origin.x
+            && cursor.x < frame.origin.x + frame.size.width
+            && cursor.y >= frame.origin.y
+            && cursor.y < frame.origin.y + frame.size.height;
+        if inside {
+            chosen = index;
+        }
+    }
+    chosen
+}
+
+/// Puts the question, the secure field and the status line into the black window
+/// on the display the pointer is on, and takes keyboard focus.
+///
+/// False means the box could not be built; the caller then ends the session
+/// rather than leaving a black screen nobody can answer.
+fn show_password_box(mtm: MainThreadMarker, windows: &[Retained<SleeplessBlackWindow>]) -> bool {
+    if windows.is_empty() {
+        log!("Password box: there are no black windows to put it in.");
+        return false;
+    }
+    let cursor = NSEvent::mouseLocation();
+    let frames: Vec<NSRect> = windows.iter().map(|window| window.frame()).collect();
+    let chosen = pick_box_window(&frames, cursor);
+    let describe: Vec<String> = frames
+        .iter()
+        .enumerate()
+        .map(|(index, frame)| {
+            format!(
+                "#{index} {}x{}@{},{}",
+                frame.size.width, frame.size.height, frame.origin.x, frame.origin.y
+            )
+        })
+        .collect();
+    log!(
+        "Password box: pointer at ({}, {}); displays {}; using #{chosen}.",
+        cursor.x,
+        cursor.y,
+        describe.join(", ")
+    );
+    let window = &windows[chosen];
+
+    let outcome = unsafe {
+        try_objc(|| {
+            let Some(content) = window.contentView() else {
+                log!("Password box: the window has no content view.");
+                return false;
+            };
+            let area = content.frame();
+            // Room for a wide field and two lines of text, centred a little
+            // below the middle (AppKit's origin is bottom-left).
+            let width: f64 = 340.0;
+            let left = (area.size.width - width) / 2.0;
+            let middle = area.size.height / 2.0;
+
+            let question = make_label(
+                &NSString::from_str("Enter your password to come back"),
+                15.0,
+            );
+            question.setFrame(NSRect::new(
+                NSPoint::new(left, middle + 46.0),
+                NSSize::new(width, 22.0),
+            ));
+            content.addSubview(&question);
+
+            let field = NSSecureTextField::new(mtm);
+            field.setFrame(NSRect::new(
+                NSPoint::new(left, middle - 14.0),
+                NSSize::new(width, 26.0),
+            ));
+            field.setEditable(true);
+            field.setPlaceholderString(Some(&NSString::from_str("password")));
+            content.addSubview(&field);
+
+            let status = make_label(&NSString::new(), 13.0);
+            status.setFrame(NSRect::new(
+                NSPoint::new(left, middle - 52.0),
+                NSSize::new(width, 22.0),
+            ));
+            content.addSubview(&status);
+
+            // Return and Escape, while this box is up. The monitor is a local
+            // one, so it only sees events for this app - which is the whole
+            // point: it never interferes with anything else, and it goes away
+            // with `hide_password_box`.
+            let monitor = NSEvent::addLocalMonitorForEventsMatchingMask_handler(
+                NSEventMask::KeyDown,
+                &RcBlock::new(|event: NonNull<NSEvent>| {
+                    let event: &NSEvent = event.as_ref();
+                    match event.keyCode() {
+                        KEY_RETURN | KEY_PAD_ENTER => {
+                            let typed = GATE_BOX.with(|slot| {
+                                slot.borrow()
+                                    .as_ref()
+                                    .map(|held| {
+                                        // Take what is being typed out of the
+                                        // field editor. While an edit is in
+                                        // progress the control's stringValue is
+                                        // the *committed* value, not the live
+                                        // text, because a shared field editor is
+                                        // the real first responder; -validateEditing
+                                        // is AppKit's documented way to copy the
+                                        // editor's contents back into the cell,
+                                        // and unlike resigning first responder it
+                                        // leaves the caret in the box.
+                                        held.field.validateEditing();
+                                        held.field.stringValue().to_string()
+                                    })
+                                    .unwrap_or_default()
+                            });
+                            let entered = typed.chars().count();
+                            GATE_KEY.with(|key| {
+                                *key.borrow_mut() = GateKey::Entered(Secret::take(typed))
+                            });
+                            log!("Password box: Return pressed, {entered} characters committed.");
+                            // Swallow it: no beep, and the field doesn't start
+                            // a new editing session behind our back.
+                            ptr::null_mut()
+                        }
+                        KEY_ESCAPE => {
+                            GATE_BOX.with(|slot| {
+                                if let Some(held) = slot.borrow().as_ref() {
+                                    // Escape never unlocks; it empties the box.
+                                    // -abortEditing throws away the in-progress
+                                    // edit (the field editor's text, not the
+                                    // cell's), which is what the user means by
+                                    // "clear what I typed"; the value is set
+                                    // empty as well in case nothing was being
+                                    // edited. Focus stays in the box.
+                                    held.field.abortEditing();
+                                    held.field.setStringValue(&NSString::new());
+                                }
+                            });
+                            GATE_KEY.with(|key| *key.borrow_mut() = GateKey::Escaped);
+                            ptr::null_mut()
+                        }
+                        _ => event as *const NSEvent as *mut NSEvent,
+                    }
+                }),
+            );
+            let Some(monitor) = monitor else {
+                log!("Password box: could not install the key monitor.");
+                return false;
+            };
+
+            window.setInitialFirstResponder(Some(&field));
+            window.makeKeyAndOrderFront(None);
+            let focused = window.makeFirstResponder(Some(&field));
+            log!(
+                "Password box: window key {}, field is first responder: {focused}.",
+                window.isKeyWindow()
+            );
+            // A box nobody can type into is not a lock screen, it's a trap: the
+            // caller hands the display back instead.
+            if !focused {
+                log!("Password box: the field did not take keyboard focus.");
+                return false;
+            }
+            GATE_BOX.with(|slot| {
+                *slot.borrow_mut() = Some(GateBox {
+                    window: window.clone(),
+                    field,
+                    status,
+                    monitor,
+                })
+            });
+            true
+        })
+    };
+    match outcome {
+        Ok(true) => true,
+        Ok(false) => false,
+        // An exception in there is a log line, not an abort.
+        Err(why) => {
+            log!("Password box could not be built: {why}");
+            false
+        }
+    }
+}
+
+/// A line of white text on the black window: no box, no background.
+fn make_label(text: &NSString, size: f64) -> Retained<NSTextField> {
+    let label = NSTextField::new(nil_marker());
+    label.setStringValue(text);
+    label.setEditable(false);
+    label.setSelectable(false);
+    label.setBezeled(false);
+    label.setDrawsBackground(false);
+    label.setTextColor(Some(&NSColor::whiteColor()));
+    label.setFont(Some(&NSFont::systemFontOfSize(size)));
+    label
+}
+
+/// What the box says right now, and a clean field to type the next attempt into.
+fn set_box_status(message: &str) {
+    GATE_BOX.with(|slot| {
+        if let Some(held) = slot.borrow().as_ref() {
+            held.status.setStringValue(&NSString::from_str(message));
+            // Never leave the attempt that just failed sitting in the box: the
+            // in-progress edit goes away first, then the cell's value.
+            held.field.abortEditing();
+            held.field.setStringValue(&NSString::new());
+            // Keyboard focus stays where it was, on the box.
+            if !held.window.isKeyWindow() {
+                held.window.makeKeyAndOrderFront(None);
+            }
+            let _ = held.window.makeFirstResponder(Some(&held.field));
+        }
+    });
+}
+
+/// Waits for the user to press Return (or Escape) in the box, pumping AppKit's
+/// queue meanwhile so the field editor works. There's no timeout on purpose:
+/// standing in front of a locked screen is allowed. The session being taken over
+/// by the OS ends the wait.
+fn wait_for_box(mtm: MainThreadMarker) -> Option<Secret> {
+    GATE_KEY.with(|key| *key.borrow_mut() = GateKey::Nothing);
+    let started = Instant::now();
+    let mut last_breadcrumb = started;
+    loop {
+        // Keeps the field editor alive: this is what delivers the keystrokes.
+        if !pump_slice(mtm) {
+            log!("Password box: AppKit stopped answering; the box is giving up.");
+            return None;
+        }
+
+        let pressed = GATE_KEY.with(|key| {
+            let mut slot = key.borrow_mut();
+            core::mem::replace(&mut *slot, GateKey::Nothing)
+        });
+        match pressed {
+            GateKey::Entered(text) => return Some(text),
+            GateKey::Escaped => {
+                log!("Password box: Escape pressed; that clears the box and does not unlock.");
+                set_box_status("Escape does not unlock Sleepless");
+                return None;
+            }
+            GateKey::Nothing => {}
+        }
+        if session_was_taken() {
+            log!("Password box: the session was taken over while waiting.");
+            return None;
+        }
+
+        // Someone standing in front of a locked screen is allowed to take their
+        // time, so there's no timeout here - but say, every twenty seconds, that
+        // the box is still up and still waiting, so a log read after the fact can
+        // tell "nobody came back" from "the box was there and deaf".
+        let now = Instant::now();
+        if now - last_breadcrumb >= Duration::from_secs(20) {
+            last_breadcrumb = now;
+            log!(
+                "Password box: still waiting for a password after {}s (window key: {}).",
+                (now - started).as_secs(),
+                GATE_BOX.with(|slot| {
+                    slot.borrow()
+                        .as_ref()
+                        .map(|held| held.window.isKeyWindow())
+                        .unwrap_or(false)
+                })
+            );
+        }
+    }
+}
+
+/// Takes the box away again, before the session ends.
+fn hide_password_box() {
+    GATE_BOX.with(|slot| {
+        if let Some(held) = slot.borrow_mut().take() {
+            unsafe { NSEvent::removeMonitor(&held.monitor) };
+            // The window is kept here so it can't go away while its subviews are
+            // answering; give up first responder on the way out.
+            held.window.makeFirstResponder(None);
+        }
+    });
+}
+
+/// objc2 needs a main-thread marker to build a view; this function is only ever
+/// called from the main thread, and the borrow of the marker is what says so.
+fn nil_marker() -> MainThreadMarker {
+    MainThreadMarker::new().expect("built from the main thread")
+}
+
+/// Runs AppKit by hand for one short slice, and returns false if it threw.
+///
+/// Two things happen in a slice, and both are needed:
+///
+/// * the event queue is drained and dispatched - this is what makes typing in the
+///   password field, and Apple's own Touch ID panel, work at all. A plain sleep on
+///   this thread delivers nothing;
+/// * the run loop is then given a brief turn, because that is how everything
+///   *else* arrives: the `com.apple.screenIsLocked` distributed notification
+///   (NSDistributedNotificationCenter delivers with `performSelectorOnMainThread:`),
+///   timers, and any other mach-port input source. Pumping only the event queue
+///   would leave the session-lock watchdog deaf exactly when it matters - while the
+///   gate is up.
+///
+/// The event fetch is bounded rather than `untilDate: nil` on purpose: with no
+/// timeout this call sleeps until an event arrives *for this app*, and a black
+/// screen session is usually not the active app, so the flags another thread sets
+/// (back / unlocked / session taken) could go unseen forever - a black screen with
+/// no prompt and no way out.
+fn pump_slice(mtm: MainThreadMarker) -> bool {
     let app = NSApplication::sharedApplication(mtm);
-    while !stop() {
-        // A bounded wait, deliberately: with `untilDate: nil` this call sleeps
-        // until an event arrives *for this app*, and a black-screen session is
-        // usually not the active app - the keyboard/mouse input that the other
-        // thread notices goes to whoever is. So the flags it sets
-        // (BACK / UNLOCKED / session taken) could go unseen forever, which is a
-        // black screen with no prompt and no way out. Waking every 40ms means
-        // the flags are always seen, event or no event.
-        let until = NSDate::dateWithTimeIntervalSinceNow(0.04);
-        while let Some(event) = unsafe {
-            app.nextEventMatchingMask_untilDate_inMode_dequeue(
+    let drained = unsafe {
+        try_objc(|| {
+            let mut count = 0usize;
+            while let Some(event) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
                 NSEventMask::Any,
-                Some(&until),
+                Some(&NSDate::distantPast()),
                 NSDefaultRunLoopMode,
                 true,
-            )
-        } {
-            app.sendEvent(&event);
+            ) {
+                app.sendEvent(&event);
+                count += 1;
+            }
+            count
+        })
+    };
+    if drained.is_err() {
+        log!(
+            "AppKit threw while dispatching events: {}",
+            drained.unwrap_err()
+        );
+        return false;
+    }
+    let slice = NSDate::dateWithTimeIntervalSinceNow(0.04);
+    let spun = unsafe {
+        try_objc(|| NSRunLoop::currentRunLoop().runMode_beforeDate(NSDefaultRunLoopMode, &slice))
+    };
+    if spun.is_err() {
+        log!(
+            "AppKit threw while spinning the run loop: {}",
+            spun.unwrap_err()
+        );
+        return false;
+    }
+    true
+}
+
+/// Runs AppKit by hand until `stop` says so, or until the session is taken over.
+///
+/// `NSApplication::run()` would do this too, but it never gives us the chance to
+/// notice that the thread watching for input has seen the user come back, and the
+/// password box has to be built on the main thread.
+fn pump_events_until(mtm: MainThreadMarker, stop: impl Fn() -> bool) {
+    while !stop() {
+        if !pump_slice(mtm) {
+            return;
+        }
+        if session_was_taken() {
+            log!("Session was taken over while pumping events: giving the screen back.");
+            return;
         }
     }
 }
@@ -682,7 +814,6 @@ fn show_cursor() {
 // ---------------------------------------------------------------------
 
 use std::ptr::NonNull;
-use std::time::Instant;
 
 use block2::RcBlock;
 use objc2::runtime::ProtocolObject;
@@ -691,7 +822,6 @@ use objc2::{define_class, msg_send, sel};
 use objc2_app_kit::{NSWorkspace, NSWorkspaceSessionDidResignActiveNotification};
 use objc2_foundation::{
     NSDate, NSError, NSNotification, NSNotificationCenter, NSObjectProtocol, NSRunLoop,
-    NSRunLoopCommonModes, NSTimer,
 };
 
 use objc2_local_authentication::{LAContext, LAPolicy};
@@ -783,7 +913,6 @@ fn evaluate(ctx: &LAContext, reason: &str, mtm: MainThreadMarker) -> bool {
         TOUCH_ID_TIMEOUT.as_secs()
     );
 
-    let app = NSApplication::sharedApplication(mtm);
     let deadline = Instant::now() + TOUCH_ID_TIMEOUT;
     while Instant::now() < deadline {
         match TOUCH_ID_ANSWER.load(Ordering::SeqCst) {
@@ -791,18 +920,18 @@ fn evaluate(ctx: &LAContext, reason: &str, mtm: MainThreadMarker) -> bool {
             2 => return false,
             _ => {}
         }
-        // One short slice of the event queue at a time, so the answer - and the
-        // prompt's own UI - gets served while we wait.
-        let until = NSDate::dateWithTimeIntervalSinceNow(0.1);
-        while let Some(event) = unsafe {
-            app.nextEventMatchingMask_untilDate_inMode_dequeue(
-                NSEventMask::Any,
-                Some(&until),
-                NSDefaultRunLoopMode,
-                true,
-            )
-        } {
-            app.sendEvent(&event);
+        // One slice at a time: events dispatched (Apple's panel is drawn and
+        // handled by this process, so a sleeping thread means a dead panel) and
+        // the run loop serviced (the reply block and any session-lock
+        // notification arrive that way).
+        if !pump_slice(mtm) {
+            log!("Touch ID wait: AppKit stopped answering.");
+            break;
+        }
+        if session_was_taken() {
+            log!("Session was taken over while Touch ID was being answered.");
+            unsafe { ctx.invalidate() };
+            return false;
         }
     }
     // Give the system prompt a hard close, so a timed-out request doesn't leave
@@ -869,7 +998,10 @@ fn passkey_unlock(mtm: MainThreadMarker) -> bool {
         return false;
     }
     // The system's prompt only appears in front of an active app, and an
-    // accessory process can't become active at all.
+    // accessory process is a harder case for the system to bring forward, so the
+    // policy goes Regular for the length of the prompt and straight back after.
+    // (Ordinary dialogs never do this: this is the one place it's still used, and
+    // it is Apple's own window we are trying to get on screen.)
     let app = NSApplication::sharedApplication(mtm);
     let policy = app.activationPolicy();
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
@@ -879,8 +1011,9 @@ fn passkey_unlock(mtm: MainThreadMarker) -> bool {
     // hidden they can't be reached.
     show_cursor();
     let answered = evaluate(&ctx, REASON_UNLOCK, mtm);
-    hide_cursor();
     app.setActivationPolicy(policy);
+    // The pointer deliberately stays visible: when Touch ID doesn't help, the
+    // password box underneath is what the user has to answer.
     answered
 }
 
@@ -1313,13 +1446,30 @@ pub fn run(opts: crate::Options) {
         release_and_exit();
     }
     if GATE_ARMED.load(Ordering::SeqCst) {
-        // Touch ID first if it was enrolled; the password is the way back when
-        // the sensor isn't available or the person would rather type.
+        // The box goes up first, so a Touch ID attempt happens with our window
+        // already key: if the sensor can't help, the field is simply still there
+        // and already focused.
+        if !show_password_box(mtm, &_windows) {
+            // Nothing to type into. Handing the screen back is better than
+            // holding a black monitor nobody can answer.
+            log!("No password box could be shown; ending the session rather than holding the screen.");
+            release_and_exit();
+        }
+        // One activation request, before anything is asked: without it the
+        // window is key but the app isn't active, and the keystrokes never
+        // arrive. (The session-lock path is what ends a run the system takes
+        // over, so no timer is needed to re-assert this.)
+        activate_app(&NSApplication::sharedApplication(mtm));
+        show_cursor();
         let unlocked = (lock::has_passkey() && passkey_unlock(mtm))
             || lock::unlock_loop(
-                |message| prompt_secret_locked("Sleepless", message),
+                |message| {
+                    set_box_status(message);
+                    wait_for_box(mtm)
+                },
                 session_was_taken,
             );
+        hide_password_box();
         if !unlocked {
             log!("Gate ended without a password: the session was taken over.");
             release_and_exit();
@@ -1336,24 +1486,40 @@ pub fn run(opts: crate::Options) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use objc2_app_kit::{
-        NSAlertSecondButtonReturn, NSModalResponseAbort, NSModalResponseCancel, NSModalResponseOK,
-    };
 
-    /// The rule that broke password enrolment from the menu bar: an NSAlert
-    /// answers with NSAlertFirstButtonReturn (1000) and friends, never with
-    /// NSModalResponseOK (1). Comparing against OK made every dialog look
-    /// cancelled - and on the lock screen that would have meant nobody could
-    /// come back at all.
+    fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
+        NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+    }
+
+    /// The box has to land on the display the pointer is on; on a two-screen desk
+    /// the alternative is a black monitor with the question on the other one.
     #[test]
-    fn only_the_first_alert_button_counts_as_accepted() {
-        assert_eq!(NSAlertFirstButtonReturn, 1000);
-        assert_eq!(NSAlertSecondButtonReturn, 1001);
+    fn the_password_box_follows_the_pointer() {
+        let main = rect(0.0, 0.0, 1920.0, 1080.0);
+        let second = rect(1920.0, 0.0, 2560.0, 1440.0);
+        let frames = [main, second];
 
-        assert!(accepted(NSAlertFirstButtonReturn));
-        assert!(!accepted(NSAlertSecondButtonReturn));
-        assert!(!accepted(NSModalResponseOK));
-        assert!(!accepted(NSModalResponseCancel));
-        assert!(!accepted(NSModalResponseAbort));
+        assert_eq!(pick_box_window(&frames, NSPoint::new(100.0, 100.0)), 0);
+        assert_eq!(pick_box_window(&frames, NSPoint::new(2000.0, 1000.0)), 1);
+        // Exactly on the shared edge belongs to the left display.
+        assert_eq!(pick_box_window(&frames, NSPoint::new(1920.0, 10.0)), 0);
+        assert_eq!(pick_box_window(&frames, NSPoint::new(1919.0, 10.0)), 0);
+        // Off every display (a pointer yanked out mid-session) still gets a
+        // window rather than nothing at all.
+        assert_eq!(pick_box_window(&frames, NSPoint::new(-500.0, -500.0)), 0);
+        // A second display placed to the left, a common layout that puts
+        // negative coordinates in play.
+        let left = rect(-2560.0, 0.0, 2560.0, 1440.0);
+        assert_eq!(
+            pick_box_window(&[main, left], NSPoint::new(-100.0, 500.0)),
+            1
+        );
+        // Stacked above rather than beside: the point above the main display
+        // lands on the upper one.
+        let above = rect(0.0, 1080.0, 1920.0, 1080.0);
+        assert_eq!(
+            pick_box_window(&[main, above], NSPoint::new(10.0, 1081.0)),
+            1
+        );
     }
 }

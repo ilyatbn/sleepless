@@ -667,7 +667,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d49e936b501e5c5bf01fda3a9452ff86dc3ea98ad5f283e1455153142d97518c"
 dependencies = [
  "bitflags",
- "libc",
+ "block2",
  "objc2",
  "objc2-core-foundation",
  "objc2-foundation",
@@ -975,10 +975,12 @@ dependencies = [
 name = "sleepless-gui"
 version = "0.2.2-beta.6"
 dependencies = [
+ "block2",
  "global-hotkey",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
+ "objc2-local-authentication",
  "png",
  "tray-icon",
  "windows-sys 0.59.0",

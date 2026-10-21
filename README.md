@@ -38,7 +38,7 @@ Grab the latest build from the [Releases](../../releases) page:
 - **Turn display off**: runs `sleepless` (with `--asroot` if the next item is ticked). Also on a global keyboard shortcut: **Ctrl+Cmd+S** on macOS, **Ctrl+Win+S** on Windows, **Ctrl+Super+S** on Linux. It waits until you let go of the keys, so releasing them doesn't wake the screen right back up.
 - **Keep awake with the lid closed (--asroot)**: remembered between runs.
 - **Launch at login**: starts the tray icon when you log in. It uses each system's own per-user mechanism, so you can also see / remove it there: the `Sleepless` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (Task Manager > Startup apps), `~/Library/LaunchAgents/io.github.ilyatbn.sleepless-gui.plist` (System Settings > General > Login Items) or `~/.config/autostart/sleepless-gui.desktop`.
-- **Set a password to come back…** / **Remove the password**: the tray starts the CLI's own prompts (`sleepless --set-password`, `--clear-password`) and waits for them; "Remove the password" is greyed out while nothing is enrolled. The credential belongs to the CLI, so the menu can't drift out of sync with it, and `sleepless` started by hand obeys the same setting.
+- **Set a password to come back…** / **Remove the password**: on macOS the tray app asks you itself - two secure fields and a confirmation, then Touch ID if the machine has it - and hands the answer to the CLI over a pipe, never in the command line or the environment. On Windows and Linux it starts the CLI's own prompts and waits for them. "Remove the password" is greyed out while nothing is enrolled. The credential belongs to the CLI either way, so the menu can't drift out of sync with it, and `sleepless` started by hand obeys the same setting.
 - **Quit Sleepless**: removes the icon. A screen-off session that's already running carries on until you come back.
 
 It's only a launcher: it looks for the `sleepless` command-line tool next to itself (then on `PATH`), so keep the two together. On macOS, Sleepless GUI.app already contains it; install it the same way as Sleepless.app below, including the `xattr` step. Only one tray icon runs per user; starting it again does nothing.
@@ -98,6 +98,12 @@ sleepless --clear-passkey
 sleepless --has-password    # exit 0 if something is enrolled, 1 if not (what the tray app asks)
 ```
 
+On macOS the CLI never puts up a window: it asks in the terminal (echo off), which is what
+running it by hand or over ssh wants. The menu-bar app is the one that shows dialogs, because
+since macOS 14 a background process started by an app can't take focus from the app you are
+typing in - that is why enrolment from the menu says *"Type it again to confirm"* in the
+tray app's own dialog rather than in a terminal window.
+
 Nothing here uses the OS lock screen, because that takes your VPN, your SSH sessions and
 the rest of the session down with it. Sleepless draws its own black screen and checks the
 answer itself:
@@ -105,7 +111,7 @@ answer itself:
 | Platform | What coming back looks like | Passkey |
 | --- | --- | --- |
 | Windows | A black window over every monitor goes up *before* the screensaver starts, so the keypress that ends the screensaver reveals that window instead of your desktop. Type the password, Enter. | not yet |
-| macOS | The black windows stay up and a password box is raised above them. | Touch ID is tried first, then the box |
+| macOS | The black windows stay up, and the one under your pointer carries the password box: it is part of the black window itself, so it holds the keyboard (Tab-free - just type and press Return). The other displays stay plain black. | Touch ID is tried with the box already up; if the sensor can't help, the field is simply still there |
 | Linux | The display comes back first (the compositor decides when DPMS does), then an askpass dialog - or the terminal, if Sleepless was started from one. | none |
 
 The password is stored as a PBKDF2-HMAC-SHA256 hash with a random salt (600 000 rounds),

@@ -824,6 +824,164 @@ only ones left.
   key is held.
 - `occlusionState` semantics on the user's display setup.
 
+## beta6 (republished): the prompt presenter is deleted, not tuned
+
+The enrolment dialogs were invisible and the lock prompt was a stack of windows
+fighting over focus. Both had the same root: this app kept trying to show UI from
+a process the system had no reason to activate.
+
+Root causes, stated plainly:
+
+1. Enrolment dialogs were shown by the CLI child (`sleepless --set-password`)
+   that the tray app spawns. Since macOS 14 activation is cooperative: a
+   background child of a GUI app does not get focus while the user is typing
+   somewhere else. Activation-policy flips, `activate` twice a second and window
+   levels above the menu bar were all attempts to override that, and all of them
+   produced the same symptom - a panel with a correct frame, on screen, invisible,
+   with the user's focus dragged back every other tick.
+2. The lock prompt was an NSAlert layered over borderless black windows. A
+   borderless NSWindow answers NO to `canBecomeKeyWindow`, so the black windows
+   could never hold the keyboard; that is why a separate panel existed at all, and
+   why it then had to fight to stay key and visible.
+
+### What the code looks like now
+
+**A. Enrolment UI lives in the tray app (`sleepless-gui`), in process.**
+`gui/src/enrol.rs`:
+- the user just clicked this app's menu, so it is the one app that is allowed to
+  activate: `activateIgnoringOtherApps` (pre-14) plus `-activate` behind
+  `respondsToSelector:`, asked **once** per dialog;
+- a plain `NSAlert` with an `NSSecureTextField` accessory view, the alert window's
+  `initialFirstResponder` set to the field, `runModal`; twice, for the confirm;
+- no timers, no window levels, no activation-policy change; the tray app stays an
+  accessory (`LSUIElement`) app, which can still activate when the user interacts
+  with it;
+- the password reaches the CLI through a pipe: `sleepless --set-password --stdin`
+  reads one line from stdin - never argv (visible in the process list), never the
+  environment (readable by any process);
+- Touch ID enrolment is `LAContext.evaluatePolicy:localizedReason:reply:` from the
+  tray process too (it has the bundle and the activation), waited for with the
+  same bounded wait; when it succeeds the CLI is asked to record it with
+  `sleepless --set-passkey --confirmed`, which writes the store without asking
+  again. Off macOS `--confirmed` refuses, because there is no passkey there to
+  confirm.
+- the CLI keeps a terminal path (`stty -echo`) for `sleepless --set-password` run
+  by hand or over ssh, and shows **no AppKit dialog at all** any more:
+  `prompt_secret_interactive`, `ask_yes_no` and `report` are terminal/stderr.
+
+**B. The lock prompt lives in the black window, in the session process.**
+`src/macos.rs`:
+- `define_class!` `SleeplessBlackWindow` (`#[unsafe(super(NSWindow))]`) overriding
+  `canBecomeKeyWindow` / `canBecomeMainWindow` to YES - the black window itself
+  takes the keyboard;
+- the question, the `NSSecureTextField` and a status line are subviews of the
+  window on the display the pointer is on (`pick_box_window`, unit-tested for
+  beside / left-of / above layouts and the shared-edge case); the other displays
+  stay plain black;
+- one `activate_app` request when the box goes up; `makeKeyAndOrderFront` +
+  `makeFirstResponder:`; if the field does **not** take focus the box is declared
+  unbuildable and the session ends with the display handed back - a box nobody can
+  type into is a trap, not a lock screen;
+- Return / keypad-Enter / Escape come from one **local** event monitor
+  (`addLocalMonitorForEventsMatchingMask:handler:`): the block returns nil to
+  swallow the key, otherwise the event unchanged. Escape clears the field and
+  never unlocks;
+- the value is read with `-validateEditing` then `-stringValue`: while an edit is
+  in progress a shared field editor is the real first responder and the control's
+  `stringValue` is the last *committed* value, so reading it straight would have
+  handed back an empty box however much was typed. Escape uses `-abortEditing`
+  (throws the in-progress edit away). Neither moves focus, so the caret stays in
+  the box for the next attempt;
+- `lock::unlock_loop` still drives the attempts and the back-off: its `ask`
+  closure sets the status line and then `wait_for_box`, which pumps until the
+  monitor reports Enter or Escape, with no timeout (standing at a locked screen is
+  allowed) and a 20-second breadcrumb saying the box is still up and whether the
+  window is still key;
+- Touch ID at the gate is evaluated from this process **after** the box appears,
+  so if the sensor can't help, the focused field is simply still there. The
+  pointer stays visible for the whole gate.
+
+**C. Deleted**: `show_modal`, `secret_alert`, `secret_from`, `accepted`,
+`prompt_secret`, `prompt_secret_locked`, `keep_prompt_on_top` + its timer and
+thread-locals, `stop_keeping_prompt_on_top`, `raise_above_black_out` for prompts,
+`centre_on_cursor_display`, the activation-policy flipping in the dialog path, and
+the tray app's `hand_over_activation` (it only existed to help a child show
+dialogs - the child shows none now). Kept: the session-lock watchers, caffeinate,
+the restore logic, the logging and the crash reporting.
+
+### Findings from the review passes over this change
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | `stringValue` during an open edit returns the committed value, not what was typed - the gate would have submitted an empty box every time | `-validateEditing` before reading, `-abortEditing` for Escape |
+| 2 | No `activate_app` call on the password-only path: the window was key but the app was not active, so keystrokes never arrived | one activation request right after the box is built |
+| 3 | `passkey_unlock` re-hid the pointer after a failed Touch ID attempt, leaving the password box with a hidden cursor | the cursor stays visible for the whole gate |
+| 4 | The CLI asked "replace the existing password?" **before** the `--stdin` branch; with no terminal that returns "no", so re-enrolment from the menu would have silently done nothing | `--stdin` is handled first, before any question |
+| 5 | Modal dialogs and the Touch ID wait ran inside `APP.with_borrow_mut`, so a menu event arriving during them would re-enter the borrow and panic | enrolment runs with no borrow held; only the menu refresh takes it afterwards |
+| 6 | `pump_events_until` only drained the event queue; `com.apple.screenIsLocked` arrives via `performSelectorOnMainThread:` on a run-loop port, so the lock watchdog could be deaf while the gate was up | every pass also gives the run loop a slice (`-runMode:beforeDate:`) |
+| 7 | `src/macos.rs`'s `#[cfg(test)] mod tests` still called `accepted()`, deleted in the same commit - invisible because `cargo check` never compiles test code and `cargo test --workspace` on Linux never compiles `src/macos.rs` | replaced with a real test of the pointer→display choice; the release workflow now runs the unit tests on all three platforms (macOS leg also compiles them with `catch-objc-exceptions` on) |
+| 8 | The typed password was copied into a `Secret`, leaving the original `String` to be freed un-zeroised | `Secret::take(String)` (used by the box and by `--stdin`), plus a test |
+| 9 | `--stdin`'s early return skipped the passkey offer without saying why, and the `--confirmed` path could record a passkey on a platform that has none | logged; `passkey_supported()` gates `--confirmed` on every platform |
+| 10 | Hand-written `+alloc` / `-initWithContentRect:...` on a runtime-defined subclass | kept (no generated constructor exists for a `define_class!` type), result *checked* with a downcast, nil-init handled, wrapped in `try_objc`, and creating the black window is a hard failure rather than a silent fallback to a non-key window |
+
+### ObjC calls in the new code, verified against the vendored bindings
+
+| selector | class | verified against | ok |
+|---|---|---|---|
+| `canBecomeKeyWindow` | NSWindow | objc2-app-kit `NSWindow.rs:1165` `-> bool` | ✓ (override signature matches) |
+| `canBecomeMainWindow` | NSWindow | `NSWindow.rs:1169` `-> bool` | ✓ |
+| `+alloc` | NSObject | runtime; `msg_send!` to `SleeplessBlackWindow::class()` | ✓ (hand-written: a runtime class has no generated constructor) |
+| `-initWithContentRect:styleMask:backing:defer:` | NSWindow | `NSWindow.rs:570` (`Allocated<Self>`, `NSRect`, `NSWindowStyleMask`, `NSBackingStoreType`, `bool`) | ✓ (hand-written, args taken from that declaration, nil-checked + downcast) |
+| `-contentView` | NSWindow | `NSWindow.rs:761` `-> Option<Retained<NSView>>` | ✓ |
+| `-frame` | NSWindow / NSView | `NSView.rs:407` `-> NSRect` | ✓ |
+| `-addSubview:` | NSView | `NSView.rs:293` | ✓ |
+| `-setFrame:` | NSView | `NSView.rs:412` | ✓ |
+| `+new` (NSSecureTextField / NSTextField) | NSControl family | `NSTextField.rs:427` `(mtm)` | ✓ |
+| `-setEditable:` | NSTextField | `NSTextField.rs:218` | ✓ |
+| `-setPlaceholderString:` | NSTextField | `NSTextField.rs:142` `Option<&NSString>` | ✓ |
+| `-setBezeled:` / `-setDrawsBackground:` / `-setSelectable:` / `-setTextColor:` | NSTextField | `NSTextField.rs:209/178/227/191` | ✓ |
+| `-stringValue` / `-setStringValue:` / `-setFont:` | NSControl | `NSControl.rs:206/213/344` | ✓ |
+| `-validateEditing` | NSControl | `NSControl.rs:442` | ✓ |
+| `-abortEditing` | NSControl | `NSControl.rs:438` `-> bool` | ✓ |
+| `+addLocalMonitorForEventsMatchingMask:handler:` | NSEvent | `NSEvent.rs:1178` (`NSEventMask`, `&DynBlock<dyn Fn(NonNull<NSEvent>) -> *mut NSEvent>`) | ✓ |
+| `-keyCode` | NSEvent | `NSEvent.rs:865` `-> c_ushort` | ✓ |
+| `+removeMonitor:` | NSEvent | `NSEvent.rs:1188` | ✓ |
+| `+mouseLocation` | NSEvent | `NSEvent.rs:1142` `-> NSPoint` | ✓ |
+| `-setInitialFirstResponder:` | NSWindow | `NSWindow.rs:1795` `Option<&NSView>` | ✓ |
+| `-makeKeyAndOrderFront:` | NSWindow | `NSWindow.rs:1092` `Option<&AnyObject>` | ✓ |
+| `-makeFirstResponder:` | NSWindow | `NSWindow.rs:952` `Option<&NSResponder> -> bool` | ✓ |
+| `-isKeyWindow` | NSWindow | `NSWindow.rs:1157` | ✓ |
+| `-setTitle:` | NSWindow | `NSWindow.rs:606` | ✓ |
+| `+whiteColor` | NSColor | `NSColor.rs:366` | ✓ |
+| `+systemFontOfSize:` | NSFont | `NSFont.rs:131` (`CGFloat` - needs the crate's `objc2-core-foundation` feature) | ✓ |
+| `-nextEventMatchingMask:untilDate:inMode:dequeue:` | NSApplication | `NSApplication.rs:908` | ✓ |
+| `-sendEvent:` | NSApplication | `NSApplication.rs:893` | ✓ |
+| `-activate` | NSApplication | `NSApplication.rs:571` (probed with `respondsToSelector:` - macOS 14+) | ✓ |
+| `-activateIgnoringOtherApps:` | NSApplication | `NSApplication.rs:555` (deprecated) | ✓ |
+| `-activationPolicy` / `-setActivationPolicy:` | NSApplication | `NSApplication.rs:743/754` | ✓ |
+| `+currentApplication` / `-activateWithOptions:` | NSRunningApplication | `NSRunningApplication.rs:260/224` | ✓ |
+| `+distantPast` / `+dateWithTimeIntervalSinceNow:` | NSDate | `NSDate.rs:212/189` | ✓ |
+| `+currentRunLoop` / `-runMode:beforeDate:` | NSRunLoop | `NSRunLoop.rs:38/116` (`&NSRunLoopMode` - needs `NSObjCRuntime`) | ✓ |
+| `-respondsToSelector:` | protocol NSObject | `NSObject.rs:196` (trait `NSObjectProtocol`) | ✓ |
+| `+new` / `-window` / `-setMessageText:` / `-setInformativeText:` / `-addButtonWithTitle:` / `-setAccessoryView:` / `-runModal` / `-setAlertStyle:` | NSAlert | `NSAlert.rs:302/289/90/103/141/221/233/163` | ✓ (tray app only) |
+| `-canEvaluatePolicy:error:` / `-evaluatePolicy:localizedReason:reply:` / `-invalidate` / `+new` | LAContext | objc2-local-authentication `LAContext.rs:236/303/323/572` | ✓ (reply block returns void) |
+
+### Verification for this round
+
+- `cargo check --tests --workspace` clean (0 warnings) for `x86_64-unknown-linux-gnu`,
+  `x86_64-pc-windows-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, and the
+  `catch-objc-exceptions` feature build for `aarch64-apple-darwin`.
+- `timeout 60 cargo test --workspace`: 18 passed, 1 ignored (`timing`), +1 in the gui crate.
+- CLI plumbing run end to end on Linux against a scratch `SLEEPLESS_CONFIG_DIR`
+  (no display involved): `--set-password --stdin` enrols (exit 0), replaces an
+  existing password (exit 0), rejects an empty line (exit 1), `--set-passkey
+  --confirmed` refuses off-macOS (exit 1), `--has-password` / `--clear-password`
+  behave, and the store holds no plaintext.
+- Still device-only: whether the box is visible *and* typeable with Terminal in
+  front, whether `com.apple.screenIsLocked` fires for Ctrl+Cmd+Q on this macOS
+  version, and whether Touch ID at the gate behaves with our window key.
+
+
 ## Sources
 
 - https://learn.microsoft.com/windows/win32/api/winreg/nf-winreg-regcreatekeyexw
@@ -848,6 +1006,8 @@ only ones left.
 - https://docs.rs/objc2-local-authentication/latest/objc2_local_authentication/struct.LAContext.html
 - https://docs.rs/objc2/latest/objc2/exception/fn.catch.html
 - https://objc2.objcs.io/objc2/ (define_class!, msg_send! Retained conversion)
+- https://developer.apple.com/documentation/appkit/nsevent/addlocalmonitorforevents(matching:handler:) (return the event unmodified, or nil to stop it being dispatched)
+- https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/TextEditing/Tasks/FieldEditor.html (the shared field editor *is* the first responder; ending an edit synchronises the cell; `validateEditing` / `abortEditing` on NSControl)
 - https://developer.apple.com/documentation/appkit/nsapplication/activate()
 - https://developer.apple.com/documentation/foundation/distributednotificationcenter (class methods +defaultCenter, +notificationCenterForType:; inherits from NSNotificationCenter)
 - https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/CocoaFundamentals/CommunicatingWithObjects/CommunicateWithObjects.html

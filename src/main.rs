@@ -83,6 +83,13 @@ pub struct Options {
     pub debug: bool,
     pub asroot: bool,
     pub command: Command,
+    /// Take the new password from stdin (one line) instead of asking. Used by
+    /// the menu-bar app, which does the asking: a command-line child of a GUI
+    /// app can't take focus from the app the user is typing in.
+    pub stdin: bool,
+    /// The system has already confirmed who the user is (the menu-bar app asked
+    /// Touch ID), so the credential can be recorded without asking again.
+    pub confirmed: bool,
 }
 
 const USAGE: &str = "\
@@ -95,6 +102,10 @@ everything once you come back (move the mouse / press a key).
   --asroot          also keep running with the lid closed (asks for your
                     password on macOS/Linux)
   --set-password    require a password to come back (asks for it twice)
+  --stdin           with --set-password: read the password from stdin (one
+                    line) instead of prompting; used by the menu-bar app
+  --confirmed       with --set-passkey: the system already confirmed the user,
+                    just record the passkey
   --clear-password  stop requiring a password to come back
   --has-password    nothing printed: exit 0 if a password is set, 1 if not
   --set-passkey     also allow Touch ID / Windows Hello to come back
@@ -113,6 +124,8 @@ fn parse_args() -> Options {
         match name.as_str() {
             "debug" => opts.debug = true,
             "asroot" => opts.asroot = true,
+            "stdin" => opts.stdin = true,
+            "confirmed" => opts.confirmed = true,
             "set-password" | "password" | "passwd" | "enroll" => {
                 opts.command = Command::SetPassword
             }
@@ -158,7 +171,7 @@ fn main() {
             0
         }
         command => {
-            let code = enroll::run(command);
+            let code = enroll::run(command, &opts);
             log!("Credential command {command:?} finished with exit code {code}");
             code
         }

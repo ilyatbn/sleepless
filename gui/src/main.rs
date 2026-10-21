@@ -20,6 +20,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod autostart;
+mod enrol;
 mod hotkey;
 mod log;
 
@@ -194,40 +195,71 @@ pub fn start_session() -> io::Result<()> {
 /// The child's output is captured and copied into the log: a menu-bar app has
 /// no console, so without this a failed enrolment leaves nothing behind. The
 /// CLI writes its own detail to the same file.
-fn run_cli(arg: &str) -> bool {
+fn run_cli(args: &[&str]) -> bool {
+    run_cli_with_stdin(args, None)
+}
+
+/// Runs the CLI child, optionally feeding it one line on stdin (`--stdin`).
+///
+/// The child shows no windows on macOS any more - this app does the asking - so
+/// there is nothing to hand activation to and the run is a plain blocking one.
+/// What it prints goes into the log, which is where a failure gets read.
+///
+/// The password goes down a pipe: never argv, which the process list shows, and
+/// never the environment, which any other process can read.
+fn run_cli_with_stdin(args: &[&str], secret: Option<&enrol::Secret>) -> bool {
     let path = sleepless_path();
     log::note(&format!(
-        "credential command: running {:?} {arg}",
-        path.canonicalize().unwrap_or_else(|_| path.clone())
+        "credential command: running {:?} {}",
+        path.canonicalize().unwrap_or_else(|_| path.clone()),
+        args.join(" ")
     ));
-    // Spawned rather than `output()` so there is a pid in the hand: on macOS the
-    // child's dialog can only come to the front cleanly if this app - the one
-    // the user actually clicked in - yields activation to it first.
-    let started = Command::new(&path)
-        .arg(arg)
+    let mut command = Command::new(&path);
+    command
+        .args(args)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
-    let child = match started {
-        Ok(child) => {
-            hand_over_activation(child.id());
-            child
-        }
+        .stderr(std::process::Stdio::piped());
+    if secret.is_some() {
+        command.stdin(std::process::Stdio::piped());
+    }
+    // Piped rather than a shell heredoc: the password never appears in argv
+    // (the process list) or the environment (any other process can read it).
+    let mut child = match command.spawn() {
+        Ok(child) => child,
         Err(e) => {
             log::note(&format!("could not run {}: {e}", path.display()));
             eprintln!("Sleepless: could not run {}: {e}", path.display());
             return false;
         }
     };
+    if let Some(secret) = secret {
+        use std::io::Write;
+        if let Some(mut stdin) = child.stdin.take() {
+            // One line; closing the pipe (dropping the handle) is what tells the
+            // child the line is complete.
+            let wrote = stdin
+                .write_all(secret.text().as_bytes())
+                .and_then(|_| stdin.write_all(b"\n"))
+                .and_then(|_| stdin.flush());
+            if let Err(e) = wrote {
+                log::note(&format!("could not hand the password to the child: {e}"));
+                let _ = child.kill();
+                return false;
+            }
+        }
+    }
     match child.wait_with_output() {
         Ok(out) => {
             for stream in [&out.stdout, &out.stderr] {
                 let text = String::from_utf8_lossy(stream).trim().to_string();
                 for line in text.lines().filter(|l| !l.is_empty()) {
-                    log::note(&format!("  {arg} said: {line}"));
+                    log::note(&format!("  {line}"));
                 }
             }
-            log::note(&format!("credential command {arg}: exit {:?}", out.status));
+            log::note(&format!(
+                "credential command {:?}: exit {:?}",
+                args, out.status
+            ));
             out.status.success()
         }
         Err(e) => {
@@ -238,49 +270,90 @@ fn run_cli(arg: &str) -> bool {
     }
 }
 
-/// macOS 14 turned activation into a request the system may decline unless the
-/// active app steps aside. The tray app is the one the user just clicked, so it
-/// asks - before the child has shown anything - that activation be yielded to
-/// the child process. Everything here is optional: a no-op on older macOS (the
-/// selector is guarded, since sending a method the system doesn't have throws),
-/// and a logged failure if the child isn't registered as an application yet.
+/// The whole enrolment conversation, in this process.
+///
+/// Order matters for one reason: the system will not let a CLI child of a GUI
+/// app take focus, so every prompt the user has to answer is answered here, and
+/// the CLI is only ever asked to save what was already typed.
 #[cfg(target_os = "macos")]
-fn hand_over_activation(pid: u32) {
-    use objc2_app_kit::{NSApplication, NSRunningApplication};
-    use objc2_foundation::NSObjectProtocol;
-
-    let Some(mtm) = objc2::MainThreadMarker::new() else {
+fn enrol_here() {
+    if password_is_set()
+        && !enrol::ask_yes_no(
+            "Sleepless",
+            "You already have a password to come back. Replace it?",
+        )
+    {
+        log::note("replacement declined at the menu");
+        return;
+    }
+    let Some(first) = enrol::ask_secret("Sleepless - new password", "Choose a password:") else {
+        enrol::notify("Sleepless", "Cancelled: no password was set.");
         return;
     };
-    let app = NSApplication::sharedApplication(mtm);
-    if !app.respondsToSelector(objc2::sel!(yieldActivationToApplication:)) {
-        log::note("this macOS has no yieldActivationToApplication:; activation is not handed over");
+    if first.text().is_empty() {
+        enrol::notify(
+            "Sleepless",
+            "That password was empty, so nothing was saved.",
+        );
         return;
     }
-    // The child only appears as a running application once it has contacted the
-    // window server, which takes a moment after spawn. Bounded, and it is the
-    // tray's own menu that waits - already blocked on the child anyway.
-    for attempt in 0..10 {
-        let pid = i32::try_from(pid).unwrap_or(-1);
-        let Some(child) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) else {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            continue;
-        };
-        app.yieldActivationToApplication(&child);
-        log::note(&format!(
-            "yielded activation to pid {pid} ({}), attempt {}",
-            child.localizedName().unwrap_or_default(),
-            attempt + 1
-        ));
+    let again = if first.text().chars().count() < 8 {
+        "That's short. Type it again to confirm:"
+    } else {
+        "Type it again to confirm:"
+    };
+    let Some(second) = enrol::ask_secret("Sleepless - new password", again) else {
+        enrol::notify("Sleepless", "Cancelled: no password was set.");
+        return;
+    };
+    if first.text() != second.text() {
+        enrol::notify(
+            "Sleepless",
+            "The two entries didn't match, so nothing was saved.",
+        );
         return;
     }
-    log::note(&format!(
-        "pid {pid} is not a running application yet; activation not handed over"
-    ));
+    if !run_cli_with_stdin(&["--set-password", "--stdin"], Some(&first)) {
+        enrol::notify(
+            "Sleepless",
+            "The password could not be saved - see the log.",
+        );
+        return;
+    }
+    enrol::notify(
+        "Sleepless",
+        "Coming back from the black screen now needs this password.\n\
+         (Only a salted hash is stored, never the password itself.)",
+    );
+    // The passkey, too, has to be asked here: Apple's Touch ID panel is only
+    // shown for an app the system is willing to activate.
+    let Some(label) = enrol::passkey_label() else {
+        log::note("no passkey available on this machine; stopping at the password");
+        return;
+    };
+    if !enrol::ask_yes_no("Sleepless", &format!("Also allow {label} to come back?")) {
+        log::note("passkey declined at the menu");
+        return;
+    }
+    if enrol::confirm_passkey("set up Touch ID to unlock Sleepless") {
+        if run_cli(&["--set-passkey", "--confirmed"]) {
+            enrol::notify(
+                "Sleepless",
+                &format!("{label} can now unlock the screen as well."),
+            );
+        } else {
+            enrol::notify(
+                "Sleepless",
+                "No passkey: the password store could not be updated.",
+            );
+        }
+    } else {
+        enrol::notify(
+            "Sleepless",
+            "No passkey: Touch ID did not confirm your identity. The password is still set.",
+        );
+    }
 }
-
-#[cfg(not(target_os = "macos"))]
-fn hand_over_activation(_pid: u32) {}
 
 /// True when coming back from the black screen needs a password. The CLI
 /// prints nothing; only its exit code matters here.
@@ -323,19 +396,9 @@ impl App {
         self.clear_password.set_enabled(password_is_set());
     }
 
-    fn enrol_password(&mut self) {
-        log::note("menu: set a password to come back");
-        let ok = run_cli("--set-password");
-        log::note(&format!(
-            "password enrolment process {}",
-            if ok { "succeeded" } else { "did not succeed" }
-        ));
-        self.refresh_password_items();
-    }
-
     fn drop_password(&mut self) {
         log::note("menu: remove the password");
-        let ok = run_cli("--clear-password");
+        let ok = run_cli(&["--clear-password"]);
         log::note(&format!(
             "password removal process {}",
             if ok { "succeeded" } else { "did not succeed" }
@@ -377,6 +440,10 @@ fn on_tray_click(event: TrayIconEvent) {
 }
 
 fn handle(event: MenuEvent) {
+    // Password enrolment is deliberately not done inside the borrow below: it
+    // runs modal dialogs and waits on Touch ID, and a menu event arriving during
+    // any of that would re-enter this same borrow and panic.
+    let mut enrol = false;
     APP.with_borrow_mut(|app| {
         let Some(app) = app else { return };
         let id = event.id();
@@ -387,7 +454,7 @@ fn handle(event: MenuEvent) {
         } else if id == app.login.id() {
             app.toggle_login();
         } else if id == app.set_password.id() {
-            app.enrol_password();
+            enrol = true;
         } else if id == app.clear_password.id() {
             app.drop_password();
         } else if id == app.quit.id() {
@@ -398,6 +465,34 @@ fn handle(event: MenuEvent) {
             std::process::exit(0);
         }
     });
+    if enrol {
+        // No borrow of APP is held across this: it runs modal dialogs and waits
+        // on Touch ID, and a menu event arriving in the middle of that would
+        // re-enter the borrow that `handle` uses and panic.
+        enrol_password();
+        APP.with_borrow_mut(|app| {
+            if let Some(app) = app {
+                app.refresh_password_items();
+            }
+        });
+    }
+}
+
+/// Asks for the new credential in the app the user clicked, then hands the
+/// answer to the CLI to save. On Windows and Linux the CLI's own prompts work
+/// (there is no cooperative activation to fight), so it still does the asking.
+fn enrol_password() {
+    log::note("menu: set a password to come back");
+    #[cfg(target_os = "macos")]
+    enrol_here();
+    #[cfg(not(target_os = "macos"))]
+    {
+        let ok = run_cli(&["--set-password"]);
+        log::note(&format!(
+            "password enrolment process {}",
+            if ok { "succeeded" } else { "did not succeed" }
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------

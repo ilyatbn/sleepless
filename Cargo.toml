@@ -56,6 +56,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSButton",
     "NSColor",
     "NSControl",
+    "NSFont",
     "NSCursor",
     "NSEvent",
     "NSGraphics",
@@ -67,6 +68,10 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSTextField",
     "NSView",
     "NSWindow",
+    # +addLocalMonitorForEventsMatchingMask:handler: takes a block.
+    "block2",
+    # CGFloat-sized API (+systemFontOfSize: and friends) lives behind this.
+    "objc2-core-foundation",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
@@ -78,6 +83,9 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSTimer",
     "NSEnumerator",
     "NSError",
+    # -runMode:beforeDate: is gated behind this (its mode argument is a
+    # validated NSString wrapper).
+    "NSObjCRuntime",
     "NSGeometry",
     "NSRunLoop",
     "NSString",

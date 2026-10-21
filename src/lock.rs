@@ -39,6 +39,13 @@ impl Secret {
         Secret(s.to_string())
     }
 
+    /// Takes a String the caller is done with, instead of copying it: used where
+    /// the plaintext already sits in a buffer that would otherwise be freed
+    /// without being overwritten.
+    pub fn take(s: String) -> Self {
+        Secret(s)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -310,6 +317,16 @@ pub fn unlock_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `take` moves the text rather than duplicating it, so the copy the caller
+    /// was holding is the one that gets zeroised on drop.
+    #[test]
+    fn take_moves_the_string_without_copying_it() {
+        let secret = Secret::take("hunter2".to_string());
+        assert_eq!(secret.expose(), "hunter2");
+        assert_eq!(secret.len(), 7);
+        assert!(!secret.is_empty());
+    }
 
     /// The store's location comes from a process-wide environment variable,
     /// so tests that touch it take turns.

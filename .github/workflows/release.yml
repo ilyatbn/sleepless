@@ -47,6 +47,11 @@ jobs:
       - name: Build release binary
         run: cargo build --release --workspace --target x86_64-pc-windows-msvc
 
+      # The only leg that runs the credential store and the Windows registry code
+      # on real Windows.
+      - name: Unit tests
+        run: cargo test -q --workspace
+
       - name: Stage release artifacts
         shell: pwsh
         run: |
@@ -81,8 +86,8 @@ jobs:
         # target, so it can only be built here, on a Mac - hence it's a feature
         # and the macOS job is the one that turns it on.
         run: |
-          cargo build --release --workspace --target aarch64-apple-darwin --features sleepless/catch-objc-exceptions
-          cargo build --release --workspace --target x86_64-apple-darwin --features sleepless/catch-objc-exceptions
+          cargo build --release --workspace --target aarch64-apple-darwin --features sleepless/catch-objc-exceptions,sleepless-gui/catch-objc-exceptions
+          cargo build --release --workspace --target x86_64-apple-darwin --features sleepless/catch-objc-exceptions,sleepless-gui/catch-objc-exceptions
           mkdir -p dist
           for bin in sleepless sleepless-gui; do
             lipo -create -output "dist/$bin" \
@@ -90,6 +95,17 @@ jobs:
               "target/x86_64-apple-darwin/release/$bin"
             lipo -info "dist/$bin"
           done
+
+      # The only leg that compiles and runs the macOS backend's own unit tests:
+      # `cargo check` never builds test code, and the Linux test leg never
+      # compiles src/macos.rs at all - which is how a test calling a function
+      # deleted in the same commit survived for weeks.
+      - name: Unit tests
+        run: cargo test -q --workspace --target aarch64-apple-darwin
+
+      # ...and with exception catching on, which only this platform can build.
+      - name: Unit tests (Objective-C exceptions caught)
+        run: cargo test -q --no-run --workspace --target aarch64-apple-darwin --features sleepless/catch-objc-exceptions,sleepless-gui/catch-objc-exceptions
 
       - name: Build Sleepless.app and Sleepless GUI.app
         run: |

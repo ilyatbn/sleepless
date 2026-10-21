@@ -233,6 +233,71 @@ Driving a prompt-driven CLI command without a GUI:
   `io::Result` and is logged.
 - Cap test runs: `timeout 60 cargo test`; bisect a hang with `cargo test <name>`.
 
+### The presenter rule (learned the hard way, three betas deep)
+
+Show UI only from a process the system is willing to activate.
+
+* A GUI app's **command-line child cannot take focus** from the app the user is
+  typing in - since macOS 14 activation is cooperative, and the system decides.
+  Every attempt to override that (activation-policy flip to `Regular`,
+  `activateIgnoringOtherApps` twice a second, window level above the menu bar,
+  `hidesOnDeactivate`, "keep on top" timers) produced the same result: a panel
+  with a correct frame that nobody could see, and focus being dragged back every
+  other tick. Enrolment prompts therefore live in the **tray app** (`gui/src/enrol.rs`),
+  which the user just clicked, and the CLI only ever receives the answer over a
+  pipe (`--set-password --stdin`) or from a terminal.
+* A **borderless `NSWindow` answers NO to `canBecomeKeyWindow`**, so it can never
+  hold the keyboard. Anything layered above it to make up for that inherits the
+  fight. Subclass it (`define_class!`, override `canBecomeKeyWindow`/
+  `canBecomeMainWindow` -> YES) and put the controls *in* it.
+* One activation request per user interaction, never a poll loop.
+
+### Field editor gotchas (`NSSecureTextField`)
+
+* While an edit is in progress the **field editor** (a shared `NSTextView`) is the
+  first responder, and `-[NSControl stringValue]` returns the last *committed*
+  value - an empty box however much the user typed. `-validateEditing` copies the
+  editor's contents into the cell; `-abortEditing` throws them away (right for
+  Escape). Both keep focus, unlike `makeFirstResponder:nil`.
+* A **local** event monitor (`addLocalMonitorForEventsMatchingMask:handler:`)
+  returning nil swallows the event. Use it for Return/Enter/Escape instead of
+  target-action plumbing; the block only sees this app's events and is removed
+  with `+removeMonitor:`.
+
+### Pumping AppKit by hand
+
+`nextEventMatchingMask:untilDate:inMode:dequeue:` + `sendEvent:` alone is not
+enough: the `com.apple.screenIsLocked` distributed notification is delivered by
+`performSelectorOnMainThread:` on a **run-loop** port, and timers and other
+mach-port sources are serviced there too. Every pass of a manual pump must also
+give the run loop a slice - `NSRunLoop.currentRunLoop().runMode_beforeDate(NSDefaultRunLoopMode, &date)`.
+And never pass `untilDate: nil`: a background app then blocks there forever and
+flags set by other threads are never seen - a black screen with no prompt.
+
+### Two CI-shaped traps
+
+* `cargo check` **never compiles test code**, and `cargo test --workspace` on
+  Linux never compiles `src/macos.rs` at all. A `#[cfg(test)] mod tests` calling a
+  function deleted in the same commit sat broken unnoticed. The release workflow
+  now runs the unit tests on all three platforms (macOS leg also compiles them
+  with `catch-objc-exceptions`), and the local matrix uses
+  `cargo check --tests --workspace --target <every target>`.
+* Don't run modal dialogs, `runModal`, or a Touch ID wait while holding a
+  `RefCell` borrow that the same thread's event handling also takes (the tray's
+  `APP` borrow and its menu handler). A menu event arriving mid-dialog re-enters
+  the borrow and panics: do the blocking work with no borrow held, then take it
+  briefly to refresh menu state.
+
+### Feature-gated bindings worth remembering
+
+objc2-app-kit hides API behind per-class features, and the error is "no
+associated function", not "enable the feature": `NSFont` (`+systemFontOfSize:`),
+`block2` (`+addLocalMonitorForEventsMatchingMask:handler:`),
+`objc2-core-foundation` (anything taking a `CGFloat`), `NSRunningApplication` +
+`libc` (`+runningApplicationWithProcessIdentifier:`). objc2-foundation needs
+`NSObjCRuntime` for `-runMode:beforeDate:` (its mode argument is a validated
+`NSRunLoopMode`).
+
 ## Releasing
 `.github/workflows/release.yml` builds Windows, macOS (universal + `.app`) and Linux
 (x86_64 + aarch64) on pushes to `main`, pull requests, and tag pushes.

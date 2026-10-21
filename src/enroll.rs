@@ -1,35 +1,90 @@
 // Turning the platform's own prompts into a stored credential:
 // `sleepless --set-password` and friends. The prompts themselves live in the
-// platform backends (a dialog on Windows, an NSAlert on macOS, an askpass
+// platform backends (a dialog on Windows, the terminal on macOS, an askpass
 // tool or the terminal on Linux); everything decided here is shared.
 //
 // Every step is logged (src/logging.rs) because the usual way to reach these
 // commands is the tray / menu bar, where nothing is printed. What's typed is
 // never logged - only how long it was.
 
-use crate::lock;
+use crate::lock::{self, Secret};
 use crate::platform;
 use crate::store;
 use crate::Command;
+use std::io;
 
 /// Runs one of the credential commands and returns the process exit code.
-pub fn run(command: Command) -> i32 {
+pub fn run(command: Command, opts: &crate::Options) -> i32 {
     match command {
-        Command::SetPassword => set_password(),
+        Command::SetPassword => set_password(opts),
         Command::ClearPassword => clear_password(),
         // Quiet: the tray app only looks at the exit code.
         Command::HasPassword => i32::from(!lock::is_enrolled()),
-        Command::SetPasskey => set_passkey(),
+        Command::SetPasskey => set_passkey(opts),
         Command::ClearPasskey => clear_passkey(),
         Command::Run => 0,
     }
 }
 
-fn set_password() -> i32 {
+/// One line from stdin, for `--stdin`: the menu-bar app asks the user and hands
+/// the answer over a pipe. Never argv (visible in the process list) and never an
+/// environment variable (visible in another process's environment).
+fn read_stdin_line() -> Option<Secret> {
+    let mut line = String::new();
+    match io::stdin().read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        // Trimmed in place and then moved, rather than sliced into a second
+        // copy: the buffer that held the password is the one that gets zeroised.
+        Ok(_) => {
+            while line.ends_with(['\n', '\r']) {
+                line.pop();
+            }
+            Some(Secret::take(line))
+        }
+    }
+}
+
+fn set_password(opts: &crate::Options) -> i32 {
     log!(
         "Enrolment started; credential store: {}.",
         store::location()
     );
+    // `--stdin` is handled before anything is asked. Whoever used it has already
+    // done the asking - the menu-bar app asks twice and confirms the replacement
+    // itself - and on macOS this process could ask nothing at all anyway: a
+    // background child cannot take focus from the app the user is typing in.
+    if opts.stdin {
+        let Some(password) = read_stdin_line() else {
+            log!("--stdin was asked for but nothing came in on stdin.");
+            platform::report("Nothing arrived on stdin, so no password was set.");
+            return 1;
+        };
+        if password.is_empty() {
+            log!("An empty password arrived on stdin.");
+            platform::report("That password was empty, so nothing was saved.");
+            return 1;
+        }
+        log!("Password arrived on stdin: {} characters.", password.len());
+        return match lock::enroll_password(&password) {
+            Ok(()) => {
+                log!("Password enrolled in {}.", store::location());
+                platform::report(
+                    "Coming back from the black screen now needs this password.\n\
+                     (Only a salted hash is stored, never the password itself.)",
+                );
+                // The passkey offer belongs to whoever asked, since that is the
+                // process the system will let show a Touch ID prompt in.
+                log!("Not offering a passkey from this process; the caller does that.");
+                0
+            }
+            Err(e) => {
+                log!("Could not write the credential: {e}");
+                platform::report(&format!("Could not save the password: {e}"));
+                1
+            }
+        };
+    }
+
     if lock::has_password() {
         log!("A password is already enrolled; asking whether to replace it.");
         if !platform::ask_yes_no(
@@ -41,8 +96,7 @@ fn set_password() -> i32 {
             return 0;
         }
     }
-
-    log!("Asking for the new password.");
+    log!("Asking for the new password in this platform's own way.");
     let Some(first) =
         platform::prompt_secret_interactive("Sleepless - new password", "Choose a password:")
     else {
@@ -151,7 +205,33 @@ fn offer_passkey() {
     }
 }
 
-fn set_passkey() -> i32 {
+fn set_passkey(opts: &crate::Options) -> i32 {
+    // The menu-bar app can ask Touch ID where this process can't; when it has,
+    // all that's left here is to record that it may be used.
+    if opts.confirmed {
+        if !lock::has_password() {
+            log!("--confirmed passkey refused: no password enrolled yet.");
+            return 1;
+        }
+        let Some(kind) = platform::passkey_supported() else {
+            log!("--confirmed passkey refused: no passkey available on this platform.");
+            return 1;
+        };
+        return match lock::enroll_passkey(kind) {
+            Ok(()) => {
+                log!(
+                    "Passkey ({kind}) recorded in {} after the caller's confirmation.",
+                    store::location()
+                );
+                0
+            }
+            Err(e) => {
+                log!("Could not record the passkey: {e}");
+                1
+            }
+        };
+    }
+
     if !lock::has_password() {
         log!("Passkey refused: no password enrolled yet.");
         platform::report(
