@@ -415,15 +415,28 @@ mod tests {
         let _store = TempStore::new("nosecret");
         let password = Secret::new("a-very-unlikely-string-to-appear-in-a-file");
         enroll_password(&password).unwrap();
-        let text = std::fs::read_to_string(
-            std::env::var("SLEEPLESS_CONFIG_DIR").unwrap() + "/sleepless.conf",
-        )
-        .unwrap();
-        assert!(
-            !text.contains(password.expose()),
-            "the file held the password"
-        );
-        assert!(text.contains("password.hash="));
+        // What "not in the clear" means depends on where the store is: a file on
+        // unix, registry values on Windows.
+        #[cfg(unix)]
+        {
+            let text = std::fs::read_to_string(
+                std::env::var("SLEEPLESS_CONFIG_DIR").unwrap() + "/sleepless.conf",
+            )
+            .unwrap();
+            assert!(
+                !text.contains(password.expose()),
+                "the file held the password"
+            );
+            assert!(text.contains("password.hash="));
+        }
+        #[cfg(windows)]
+        {
+            let salt = store::get(SECTION, "salt").expect("a salt was stored");
+            let hash = store::get(SECTION, "hash").expect("a hash was stored");
+            assert!(!salt.contains(password.expose()), "the salt held it");
+            assert!(!hash.contains(password.expose()), "the hash held it");
+            assert_eq!(hash.len(), 64, "32 bytes of PBKDF2 output, in hex");
+        }
         // Two records for the same password use different salts.
         let first = store::get(SECTION, "salt").unwrap();
         enroll_password(&password).unwrap();
