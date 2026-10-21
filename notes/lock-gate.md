@@ -178,6 +178,56 @@ Tray app: menu items for the same, with the enabled/checked state read through
 - macOS Touch ID from an ad-hoc signed bundle may be refused by LocalAuthentication;
   handled as "passkey unavailable".
 
+## Release
+
+Pushed as branch `lock-gate` from `claude/macos-linux-support-lhfrj9`, squashed to one
+commit (`1f716e0`, the pre-squash tip kept locally as `lock-gate-pre-squash` until the
+release was confirmed good, then deleted - it was never pushed), and tagged
+`v0.2.2beta1`: the first release built from a tag push rather than a manual run.
+
+Run 11 of "Build and Release" **completed successfully**: Windows (MSVC), macOS
+universal + `.app`, Linux x86_64 and aarch64. The release page shows
+"Sleepless v0.2.2beta1" as a pre-release, not Latest, with all eight assets.
+
+## What the shipped artifacts were checked against
+
+- Released Linux x86_64 `sleepless`: runs, prints the new flags, and enrolling through a
+  real pty with `DISPLAY` unset wrote `password.kdf/iterations/salt/hash` (600 000 rounds)
+  with no plaintext in the file; `--has-password` then exited 0.
+- Released `sleepless.exe`: `PE32+ executable (GUI) x86-64`, imports user32/gdi32/
+  advapi32/kernel32, and contains the new code's strings - the `SleeplessLock` window
+  class and "Unlock", the `SleeplessPrompt` dialog with its STATIC/EDIT/BUTTON children,
+  the `pbkdf2-sha256` record keys, and "Segoe UI" for the lock screen's font.
+- Released macOS binary: universal Mach-O (x86_64 + arm64) that references `LAContext`,
+  `canEvaluatePolicy:error:`, `evaluatePolicy:localizedReason:reply:` and
+  `NSSecureTextField`, with LocalAuthentication appearing in its load commands - so the
+  Touch ID path is actually linked into the shipped bundle, not just compiled.
+
+None of that proves the lock screens *behave*; see the checklist above.
+
+## Device testing checklist (nothing here can do these)
+
+1. `sleepless --set-password` on each platform: Windows and macOS show their own dialog,
+   Linux a terminal prompt when started from a terminal (and zenity when started from the tray).
+2. Windows: start a session with a password enrolled - does the black window cover every
+   monitor, is the desktop never flashed when the screensaver ends, does the box have focus,
+   does Alt+Tab / a notification / the taskbar manage to get on top of it, and are Escape and
+   Alt+F4 really harmless while locked?
+3. Windows heal: kill `sleepless.exe` while locked (Task Manager), then start it again -
+   `--debug` should log "Found a restore point from a run that was killed" and the power
+   sliders should be back where they were.
+4. macOS: the alert must appear above the black windows (level + 1) on the display you're
+   looking at, and the Touch ID prompt should come before the box when a passkey is enrolled.
+   The Touch ID part is the most likely thing to be refused on an ad-hoc signed bundle - it
+   must then fall back to the password box without hanging.
+5. macOS: with the passkey path, check the wait for the completion handler doesn't sit there
+   for the full 120 s timeout when the prompt is cancelled.
+6. Tray app: "Remove the password" greyed out until something is enrolled, and correct
+   afterwards; on Windows the tray icon is unresponsive while the CLI dialog is open
+   (deliberate: the menu event handler waits for the child).
+7. Linux (GNOME/KDE/X11): the askpass dialog appears after the display comes back, and the
+   power settings are only restored once the password is right.
+
 ## Sources
 
 - https://learn.microsoft.com/windows/win32/api/winreg/nf-winreg-regcreatekeyexw
