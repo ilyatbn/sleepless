@@ -122,6 +122,19 @@ point the next time Sleepless starts, and on macOS/Linux the helpers that hold t
 no-sleep state go away with the process. When you want the real thing, lock the session
 yourself (`Win+L` / `Ctrl+Cmd+Q`); Sleepless never triggers that for you.
 
+**Locking the session always wins.** Sleepless watches for the OS taking the session over
+and gets out of the way immediately - the black windows come down and everything it changed
+is put back:
+
+| Platform | What it listens for |
+| --- | --- |
+| macOS | the session being resigned (`NSWorkspaceSessionDidResignActiveNotification`) and `com.apple.screenIsLocked` |
+| Windows | `WM_WTSSESSION_CHANGE` with `WTS_SESSION_LOCK`, through a message-only watch window; logoff/shutdown is allowed through too |
+| Linux | logind's `LockedHint` for the session, and the desktop screensaver going active, polled every few seconds |
+
+So if a prompt ever fails to appear - or a run gets stuck for any reason - **lock the
+machine and Sleepless ends**. That's a deliberate safety valve, not a fallback.
+
 ### If something doesn't work: the log file
 
 Both Sleepless programs append to one plain-text log, started whether or not `--debug`

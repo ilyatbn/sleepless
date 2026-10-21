@@ -203,7 +203,95 @@ fn start_inhibitor(opts: crate::Options) {
     log!("Inhibitor lock held ({what}); released automatically when Sleepless exits.");
 }
 
+// ---------------------------------------------------------------------
+// The OS taking the session over
+//
+// When the desktop locks the session - logind's LockedHint, or the
+// screensaver going active - Sleepless gets out of the way: the run ends, the
+// display settings are restored and the inhibitor lock goes with the process.
+// Locking the machine must always be a way out of Sleepless, including if one
+// of our own prompts ever gets stuck.
+// ---------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static SESSION_TAKEN: AtomicBool = AtomicBool::new(false);
+
+fn session_was_taken() -> bool {
+    SESSION_TAKEN.load(Ordering::SeqCst)
+}
+
+/// The freedesktop / GNOME / KDE screensaver being active is what those
+/// desktops set when they put up their own lock.
+fn screensaver_active() -> Option<bool> {
+    let reply = dbus_call(
+        "org.freedesktop.ScreenSaver",
+        "/org/freedesktop/ScreenSaver",
+        "org.freedesktop.ScreenSaver",
+        "GetActive",
+    )?;
+    Some(reply.contains("true"))
+}
+
+fn session_id() -> Option<String> {
+    if let Ok(id) = env::var("XDG_SESSION_ID") {
+        if !id.is_empty() {
+            return Some(id);
+        }
+    }
+    let listing = run_output("loginctl", &["list-sessions", "--no-legend"])
+        .or_else(|| run_output("loginctl", &["list-sessions"]))?;
+    listing
+        .lines()
+        .find(|line| !line.trim().is_empty())?
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+}
+
+fn loginctl_locked_hint() -> Option<bool> {
+    let id = session_id()?;
+    let out = run_output("loginctl", &["show-session", &id, "-p", "LockedHint"])?;
+    Some(out.trim().ends_with("yes"))
+}
+
+fn session_locked() -> Option<bool> {
+    // logind's hint first, and only for the answer. The desktop's own
+    // screensaver goes active on its idle timer whether or not anything is
+    // locked, so treating that as "the session was taken" would end a
+    // Sleepless run early; it's only used on a machine where logind can't be
+    // asked at all.
+    if let Some(locked) = loginctl_locked_hint() {
+        return Some(locked);
+    }
+    screensaver_active()
+}
+
+/// Polls for the lock; there's no subscription primitive here without a D-Bus
+/// client library, and a query every few seconds is cheap next to the idle
+/// polling this backend already does.
+fn watch_session_locks() {
+    thread::spawn(|| {
+        loop {
+            thread::sleep(Duration::from_secs(3));
+            match session_locked() {
+                Some(true) => {
+                    log!("The desktop locked the session: Sleepless is getting out of the way.");
+                    SESSION_TAKEN.store(true, Ordering::SeqCst);
+                    return;
+                }
+                Some(false) => {}
+                // Nothing to ask on this desktop (no logind, no screensaver
+                // service): keep looking, the wait loop has its own ends.
+                None => {}
+            }
+        }
+    });
+}
+
 pub fn run(opts: crate::Options) {
+    watch_session_locks();
+
     if unix::is_root() && env::var_os("SUDO_USER").is_some() {
         eprintln!(
             "Sleepless: running under sudo usually can't reach your desktop session to turn the display off.\n\
@@ -230,8 +318,8 @@ pub fn run(opts: crate::Options) {
     // --- 3. Wait for the user to come back ---
     let returned = match backend {
         _ if !turned_off => false,
-        Backend::Gnome => unix::wait_for_activity(gnome_idle),
-        Backend::Kde => unix::wait_for_activity(freedesktop_idle),
+        Backend::Gnome => unix::wait_for_activity(gnome_idle, session_was_taken),
+        Backend::Kde => unix::wait_for_activity(freedesktop_idle, session_was_taken),
         Backend::X11 => {
             // The X server turns DPMS back on by itself on input, the
             // same way the Windows screensaver ends.
@@ -249,7 +337,7 @@ pub fn run(opts: crate::Options) {
         Backend::None => false,
     };
 
-    if !returned {
+    if !returned && !session_was_taken() {
         // Couldn't turn the screen off / watch for input: still useful as
         // a "keep awake" until the user stops it.
         eprintln!(
@@ -269,7 +357,9 @@ pub fn run(opts: crate::Options) {
     // --- 3.5 Password gate ---
     // The display is back and the desktop is visible: hold the session open
     // until the password is typed. See the notes in unlock_gate().
-    if returned && lock::is_enrolled() {
+    if session_was_taken() {
+        log!("Session was locked by the desktop mid-run: restoring and exiting.");
+    } else if returned && lock::is_enrolled() {
         unlock_gate();
     }
 
@@ -301,7 +391,10 @@ pub fn run(opts: crate::Options) {
 /// thing to use when a real boundary is needed.
 fn unlock_gate() {
     log!("A password is enrolled: asking before restoring the power settings.");
-    lock::unlock_loop(|message| prompt_secret("Sleepless", message));
+    lock::unlock_loop(
+        |message| prompt_secret("Sleepless", message),
+        session_was_taken,
+    );
     log!("Password accepted - restoring the power settings.");
 }
 

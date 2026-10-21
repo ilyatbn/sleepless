@@ -239,13 +239,30 @@ impl Backoff {
 /// prompt the platform has (a black overlay on Windows and macOS, an askpass
 /// dialog on Linux) and returns None when it was dismissed.
 ///
-/// Returns only once the password matches: cancelling keeps you locked out
-/// rather than letting you through. Passkeys are checked by the platform in
-/// front of this, so they never appear here.
-pub fn unlock_loop(mut ask: impl FnMut(&str) -> Option<Secret>) {
+/// Cancelling a prompt is not an escape: it counts as a failed attempt and
+/// asks again. Passkeys are checked by the platform in front of this, so they
+/// never appear here.
+///
+/// `cancelled` is consulted before every attempt and ends the loop with
+/// `false`: the OS taking the session over (its own lock screen, a fast user
+/// switch) has to be able to interrupt a gate whose prompt is wedged. Returns
+/// whether the password was accepted.
+pub fn unlock_loop(
+    mut ask: impl FnMut(&str) -> Option<Secret>,
+    mut cancelled: impl FnMut() -> bool,
+) -> bool {
     let mut backoff = Backoff::default();
     let mut message = "Enter your password to come back";
     loop {
+        // The OS taking the session over must always get us out of here, even
+        // if our own prompt is wedged: that's the documented safety valve.
+        if cancelled() {
+            log!(
+                "Lock screen giving up after {} attempt(s): the session was taken over.",
+                backoff.attempts()
+            );
+            return false;
+        }
         match ask(message) {
             Some(secret) => {
                 let wait = backoff.penalty();
@@ -258,7 +275,7 @@ pub fn unlock_loop(mut ask: impl FnMut(&str) -> Option<Secret>) {
                         "Password accepted ({} failed attempt(s)).",
                         backoff.attempts()
                     );
-                    return;
+                    return true;
                 }
                 backoff.failure();
                 message = "Wrong password, try again";
@@ -425,15 +442,39 @@ mod tests {
         ]
         .into_iter();
         let mut messages = Vec::new();
-        unlock_loop(|message| {
-            messages.push(message.to_string());
-            answers.next().flatten()
-        });
+        assert!(unlock_loop(
+            |message| {
+                messages.push(message.to_string());
+                answers.next().flatten()
+            },
+            || false,
+        ));
         // The loop stopped at the right password and told the user why the
         // second prompt was different.
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0], "Enter your password to come back");
         assert_eq!(messages[1], "Wrong password, try again");
+    }
+
+    /// The OS taking the session over has to interrupt the gate even when the
+    /// password has never been accepted - that's the way out of a stuck prompt.
+    #[test]
+    fn the_loop_stops_when_the_session_is_taken_over() {
+        let _store = TempStore::new("unlockcancel");
+        enroll_cheaply("letmein");
+
+        // Shared between the two closures, so a Cell rather than a mutable
+        // local (both closures would have to borrow it).
+        let asked = std::cell::Cell::new(0usize);
+        let unlocked = unlock_loop(
+            |_| {
+                asked.set(asked.get() + 1);
+                Some(Secret::new("wrong on purpose"))
+            },
+            || asked.get() >= 2,
+        );
+        assert!(!unlocked, "a cancelled gate must not report success");
+        assert_eq!(asked.get(), 2, "should stop as soon as cancelled() says so");
     }
 
     #[test]
@@ -443,10 +484,13 @@ mod tests {
 
         let mut answers = [None, Some(Secret::new("letmein"))].into_iter();
         let mut asked = 0;
-        unlock_loop(|_| {
-            asked += 1;
-            answers.next().flatten()
-        });
+        assert!(unlock_loop(
+            |_| {
+                asked += 1;
+                answers.next().flatten()
+            },
+            || false,
+        ));
         assert_eq!(asked, 2);
     }
 

@@ -13,8 +13,6 @@ use std::env;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::OnceLock;
-use std::thread;
-use std::time::Duration;
 
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{HANDLE, HLOCAL, HWND};
@@ -974,10 +972,148 @@ pub fn ask_yes_no(title: &str, message: &str) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------
+// The OS taking the session over
+//
+// When Windows locks the workstation (Win+L, the lock button, a screensaver
+// lock policy) Sleepless gets out of the way: the run ends through its normal
+// path, so the power settings are put back and the black overlay comes down.
+// Locking the machine must always be a way out of Sleepless, including if one
+// of our own prompts ever gets stuck.
+//
+// The notification arrives as a window message, so a message-only watch
+// window is created for the whole run (whether or not a password is
+// enrolled), and the waiting loops sleep through MsgWaitForMultipleObjectsEx
+// so they can see it.
+// ---------------------------------------------------------------------
+
+use windows_sys::Win32::System::RemoteDesktop::{
+    WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    MsgWaitForMultipleObjectsEx, PeekMessageW, HWND_MESSAGE, PM_REMOVE, QS_ALLINPUT,
+    WM_QUERYENDSESSION, WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+};
+
+const WATCH_CLASS_NAME: &str = "SleeplessWatch";
+
+static SESSION_TAKEN: AtomicBool = AtomicBool::new(false);
+
+fn session_was_taken() -> bool {
+    SESSION_TAKEN.load(Ordering::SeqCst)
+}
+
+unsafe extern "system" fn watch_proc(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> isize {
+    match msg {
+        WM_WTSSESSION_CHANGE => {
+            match wparam as u32 {
+                WTS_SESSION_LOCK => {
+                    log!("Windows locked the session: Sleepless is getting out of the way.");
+                    SESSION_TAKEN.store(true, Ordering::SeqCst);
+                    // Ends whatever message loop is waiting on a prompt.
+                    PostQuitMessage(0);
+                }
+                WTS_SESSION_UNLOCK => log!("Windows reports the session unlocked again."),
+                other => log!("Windows session change: {other}"),
+            }
+            0
+        }
+        // Logoff or shutdown: allow it. Anything left undone is picked up by
+        // the restore point on the next run.
+        WM_QUERYENDSESSION => {
+            log!("Logoff or shutdown requested: allowing it.");
+            1
+        }
+        // Every registration needs a matching unregistration before the window
+        // goes away, or a later notification is delivered to a dead HWND.
+        WM_DESTROY => {
+            let _ = WTSUnRegisterSessionNotification(hwnd);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Creates the message-only watch window and subscribes it to session
+/// changes. Failure is only worth a log line: the restore point still covers
+/// the power settings if we're killed.
+fn start_session_watch() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let class_name = wide(WATCH_CLASS_NAME);
+    let wc = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        style: 0,
+        lpfnWndProc: Some(watch_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: ptr::null_mut(),
+        hIcon: ptr::null_mut(),
+        hCursor: ptr::null_mut(),
+        hbrBackground: ptr::null_mut(),
+        lpszMenuName: ptr::null(),
+        lpszClassName: class_name.as_ptr(),
+        hIconSm: ptr::null_mut(),
+    };
+    if unsafe { RegisterClassExW(&wc) } == 0 {
+        log!("Could not register the session watch window class.");
+        return;
+    }
+    let hwnd = unsafe {
+        CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            wide("Sleepless").as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null(),
+        )
+    };
+    if hwnd.is_null() {
+        log!("Could not create the session watch window.");
+        return;
+    }
+    let registered = unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) };
+    log!("Session watch window ready; WTSRegisterSessionNotification -> {registered}.");
+}
+
+/// Runs whatever messages this thread has waiting (session changes, and while
+/// locked the lock screen's own messages).
+unsafe fn pump_messages() {
+    let mut msg: MSG = std::mem::zeroed();
+    while unsafe { PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
+        unsafe {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+/// Sleeps up to `ms` but wakes for messages, so a session lock is noticed
+/// even while we're just waiting for the screensaver.
+fn interruptible_sleep(ms: u32) {
+    unsafe {
+        MsgWaitForMultipleObjectsEx(0, ptr::null(), ms, QS_ALLINPUT, 0);
+        pump_messages();
+    }
+}
+
 pub fn run(opts: crate::Options) {
     // If an earlier run was killed (which is the documented way out of the
     // lock screen), its power settings are still changed. Put them back first.
     heal_stale_restore_point();
+
+    // Watch for Windows taking the session over: locking the workstation has
+    // to end this run, prompt or no prompt.
+    start_session_watch();
 
     // --- 1. Save current sleep / screen-off timeouts, then disable them ---
     log!("Reading the active power scheme...");
@@ -1094,8 +1230,8 @@ pub fn run(opts: crate::Options) {
     // "not running" before it ever begins.
     log!("Waiting for the screensaver to report as running...");
     let mut waited_ms = 0u32;
-    while !screensaver_is_running() && waited_ms < 5000 {
-        thread::sleep(Duration::from_millis(100));
+    while !screensaver_is_running() && waited_ms < 5000 && !session_was_taken() {
+        interruptible_sleep(100);
         waited_ms += 100;
     }
     if screensaver_is_running() {
@@ -1107,12 +1243,15 @@ pub fn run(opts: crate::Options) {
     // --- 3. Wait for the screensaver to end, then revert everything ---
     log!("Waiting for the screensaver to stop (move the mouse / press a key)...");
     let mut ticks = 0u32;
-    while screensaver_is_running() {
-        thread::sleep(Duration::from_secs(1));
+    while screensaver_is_running() && !session_was_taken() {
+        interruptible_sleep(1000);
         ticks += 1;
         if ticks % 30 == 0 {
             log!("...still waiting ({ticks}s elapsed)");
         }
+    }
+    if session_was_taken() {
+        log!("The session was locked while the screensaver was up.");
     }
     log!("Screensaver has stopped.");
 
@@ -1124,15 +1263,24 @@ pub fn run(opts: crate::Options) {
         log!("Asking for the password before the session ends.");
         match overlay {
             Some(overlay) => {
-                lock::unlock_loop(|message| unsafe { lock_overlay_ask(overlay, message) });
+                let unlocked = lock::unlock_loop(
+                    |message| unsafe { lock_overlay_ask(overlay, message) },
+                    session_was_taken,
+                );
                 unsafe { lock_overlay_free(overlay) };
+                if !unlocked {
+                    log!("Gate ended without a password: the session was taken over.");
+                }
             }
             // The overlay couldn't be created (or the credential appeared
             // while we were running): fall back to the ordinary password
             // dialog rather than letting the session end unasked.
             None => {
                 log!("No lock screen window; asking through the password dialog instead.");
-                lock::unlock_loop(|message| prompt_secret("Sleepless", message));
+                lock::unlock_loop(
+                    |message| prompt_secret("Sleepless", message),
+                    session_was_taken,
+                );
             }
         }
         log!("Password accepted.");

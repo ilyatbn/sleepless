@@ -82,6 +82,44 @@ Driving a prompt-driven CLI command without a GUI:
   is an extern static (unsafe to name), and `LAContext` needs
   `#[link(name = "LocalAuthentication", kind = "framework")]` before
   `AnyClass::get("LAContext")` finds it at all.
+- **Waiting on a `LAContext` reply needs the AppKit event queue, not a run-mode slice.**
+  The reply block is delivered on the main queue and the prompt lives in a modal panel, so
+  `NSRunLoop::runMode_beforeDate(NSDefaultRunLoopMode, ..)` left the dialog on screen with
+  nothing servicing it and the caller stuck until it was killed. `evaluate()` now dequeues
+  and dispatches events itself (the same thing `NSApplication::run` does) and gives up after
+  `TOUCH_ID_TIMEOUT` with the `NSError` domain/code logged, so enrolment can only finish,
+  fail, or time out - never hang.
+- Related: an accessory process (a tray-started helper) does not reliably get that prompt
+  shown in front of it, so `passkey_enroll` flips the activation policy to `Regular` and
+  activates before asking, then puts the policy back.
+- **Anything that has to stay visible during `NSAlert::runModal` needs its timer in the
+  common modes**: a modal alert runs the loop in `NSModalPanelRunLoopMode`, so
+  `NSTimer::scheduledTimerWithTimeInterval_repeats_block` alone never fires; add the same
+  timer again with `NSRunLoop::addTimer_forMode(&timer, NSRunLoopCommonModes)`. That timer
+  is what re-asserts the prompt's window level, ordering and app activation twice a second,
+  because a beta ended up with the prompt behind its own black windows.
+- macOS session-lock signals: `NSWorkspace::sharedWorkspace().notificationCenter()` +
+  `addObserverForName_object_queue_usingBlock` only exists in the bindings with foundation
+  features `NSNotification`, `NSOperation`, `NSString` and `block2`, and the returned token
+  (plus the block) must be kept alive. `NSDistributedNotificationCenter` has no bindings in
+  `objc2-app-kit` 0.3, so `com.apple.screenIsLocked` is subscribed through `AnyClass::get` +
+  `msg_send!` behind a `respondsToSelector` check.
+- Windows session lock: `WTSRegisterSessionNotification` lives in
+  `Win32::System::RemoteDesktop` (needs that feature) and arrives as `WM_WTSSESSION_CHANGE`
+  on a window, so a *message-only* window (`HWND_MESSAGE`) is created for the whole run.
+  A waiting loop that uses `thread::sleep` can't see it:
+  `MsgWaitForMultipleObjectsEx(0, null, ms, QS_ALLINPUT, 0)` plus a `PeekMessageW` drain can.
+  `WTS_SESSION_LOCK`/`WTS_SESSION_UNLOCK` are in `UI::WindowsAndMessaging`, not RemoteDesktop.
+- Linux has no subscription primitive without a D-Bus client library, so the lock is
+  *polled*: `loginctl show-session <id> -p LockedHint`, the id from `XDG_SESSION_ID` when set
+  and otherwise the first row of `loginctl list-sessions --no-legend` (it is unset here).
+  Cinnamon's ScreenSaver service answers `GetActive` with a D-Bus error, so that check has
+  to stay a `None` rather than become a false positive.
+- `lock::unlock_loop` takes a `cancelled` predicate and returns whether the password was
+  accepted. The OS taking the session over is the one thing that must always interrupt a
+  lock screen, so every platform passes its own flag and then follows its normal restore
+  path. On macOS a separate watchdog thread just ends the process, because a main thread
+  inside `runModal` can't check anything itself.
 - Tests: the store location is an environment variable, so the test helper takes a process
  -wide lock. Without it, two tests switch the directory under each other and an "ask until
   correct" loop never terminates - which looks like a hung test suite, not a broken test.

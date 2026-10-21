@@ -175,8 +175,13 @@ pub fn wait_until(child: &mut Child, timeout: Duration, mut check: impl FnMut() 
 /// Blocks until the user comes back, judged by an idle-time counter that
 /// resets on any keyboard/mouse input. The unit doesn't matter (seconds,
 /// milliseconds...) - only that it grows while idle and drops on input.
-/// Returns false if the counter can't be read at all.
-pub fn wait_for_activity(mut idle: impl FnMut() -> Option<f64>) -> bool {
+/// Returns false if the counter can't be read at all, or if `cancel` says the
+/// session has been taken over (the OS lock screen, a fast user switch): the
+/// caller then restores its settings and exits rather than waiting forever.
+pub fn wait_for_activity(
+    mut idle: impl FnMut() -> Option<f64>,
+    mut cancel: impl FnMut() -> bool,
+) -> bool {
     // Let the keypress / click that launched us settle first.
     thread::sleep(Duration::from_millis(1500));
     let Some(mut prev) = idle() else {
@@ -189,6 +194,10 @@ pub fn wait_for_activity(mut idle: impl FnMut() -> Option<f64>) -> bool {
         ticks += 1;
         if ticks.is_multiple_of(30) {
             log!("...still waiting ({ticks}s elapsed)");
+        }
+        if cancel() {
+            log!("The session was taken over while waiting; stopping the wait.");
+            return false;
         }
         match idle() {
             Some(now) if now < prev => {

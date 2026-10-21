@@ -272,6 +272,110 @@ None of that proves the lock screens *behave*; see the checklist above.
 7. Linux (GNOME/KDE/X11): the askpass dialog appears after the display comes back, and the
    power settings are only restored once the password is right.
 
+## beta3: three reports from the device (2026-10-21)
+
+Three problems came back from testing `v0.2.2beta2` on macOS. All three are fixed here;
+none of them could be reproduced on this machine, so the fix is paired with logging that
+will name the cause if any part of it is still wrong.
+
+### 1. Enrolment hung after the Touch ID prompt
+
+Status: fixed, most likely cause identified.
+
+- `evaluate()` asked `LAContext` for the prompt and then waited by running the run loop in
+  `NSDefaultRunLoopMode` in 0.1 s slices, polling a channel for the reply. On the device the
+  prompt appeared and then nothing ever came back, so the process sat until it was killed.
+- What that shape means: the reply block is dispatched on the main queue, and the prompt
+  itself is a modal panel, which AppKit services in `NSModalPanelRunLoopMode`. A loop that
+  only ever runs the default mode drains neither of them reliably - the panel is on screen
+  but unreachable, so the block never runs.
+- Fix: wait the way `NSApplication::run` does - `nextEventMatchingMask:untilDate:inMode:
+  dequeue:` (0.1 s slices) + `sendEvent:` - so the prompt's own UI and the main queue are
+  both serviced. The answer lands in a static `AtomicU8` (0 waiting / 1 yes / 2 no) instead
+  of a channel, because a reply that arrives after the timeout must not be able to confuse
+  anything.
+- Hard bound: `TOUCH_ID_TIMEOUT` is 45 s. On timeout the log says so and `passkey_enroll`
+  returns `Err`, which `enroll` turns into "No passkey: ..." - the password is still saved
+  and the process exits 0. Enrolment can now finish, fail, or time out; it cannot hang.
+- Every step is logged: whether `LAContext` exists, `canEvaluatePolicy`'s answer, the
+  request being started, the reply with the `NSError` code + domain + description, and the
+  timeout. The error text is what a device report needs to be diagnosable: `code -1001`
+  (user cancelled) and `code -1000`/`-1004` (system refused us) are completely different
+  bugs.
+- Belt and braces: `passkey_enroll` now sets the activation policy to `Regular` and activates
+  the app before asking. An accessory process started by the tray is not a reliable host for
+  a system prompt, and a prompt nobody can see is indistinguishable from a hang.
+
+### 2. Black screen with no prompt after the hung process was killed
+
+Status: fixed as far as it can be without the hardware; the escape hatch is the point.
+
+- The beta's prompt was an `NSAlert` raised to level 1001 once, before `runModal`. If
+  anything else ordered itself front afterwards - the modal loop, another process, another
+  display - it ended up under the level-1000 black windows, which looks exactly like a
+  machine that will not wake up.
+- Fixes: the app is activated before the prompt; the alert is centred **on the display the
+  pointer is on** (it used to land on the main display, which with more than one monitor can
+  be the one nobody is looking at); and a repeating 0.5 s timer registered in
+  `NSRunLoopCommonModes` re-asserts the level, `orderFrontRegardless` and the activation for
+  as long as the prompt is up. The log records the display list, the chosen frame, the level
+  and whether the password box became first responder.
+- `lock::unlock_loop` gained a `cancelled` predicate and returns whether the password was
+  accepted (test: `the_loop_stops_when_the_session_is_taken_over`). A prompt loop that
+  cannot be interrupted is what turned this into a dead end.
+
+### 3. The OS lock screen must force Sleepless out
+
+Status: implemented on all three platforms. Locking the machine is now a documented,
+guaranteed way out of Sleepless - which is also the answer to a stuck prompt.
+
+- macOS: `NSWorkspaceSessionDidResignActiveNotification` (public API, posted on lock and on
+  fast user switch) and `com.apple.screenIsLocked` on `NSDistributedNotificationCenter`
+  (no bindings, so runtime class lookup + `msg_send!`, guarded by `respondsToSelector`).
+  Either one sets `OS_SESSION_TAKEN`. A watchdog thread polls that flag every 500 ms and
+  calls `release_and_exit()`, which stops `caffeinate` (kept in a `static Mutex<Option<Child>>`
+  so any thread can reach it) and exits - the black windows belong to the process, so they
+  go with it, and the root helper's own `while kill -0` loop restores `pmset`. The wait
+  loop and the gate both take the flag as their cancel predicate too.
+- Windows: a message-only window registered with `WTSRegisterSessionNotification`;
+  `WTS_SESSION_LOCK` sets `SESSION_TAKEN` and `PostQuitMessage(0)` breaks out of any prompt
+  message loop, so `run()` continues through its normal path - power settings written back,
+  restore point deleted, overlay destroyed. `WM_QUERYENDSESSION` is answered with "allow",
+  and anything left undone is still covered by the restore point at the next start. The
+  blank-phase sleeps became `MsgWaitForMultipleObjectsEx` + `PeekMessageW` so the message is
+  actually seen while waiting.
+- Linux: a poller thread asks logind for the session's `LockedHint` (plus the freedesktop
+  screensaver's `GetActive` where that service implements it) every 3 s; on locked it sets
+  `SESSION_TAKEN`, which cancels `unix::wait_for_activity` and the gate, and the display
+  settings are restored through the normal path. `unix::wait_for_activity` gained the
+  `cancel` parameter for this reason; macOS passes its own flag to it.
+
+### Verification done here
+
+- `cargo check --workspace` clean (0 warnings) on `x86_64-unknown-linux-gnu`,
+  `x86_64-pc-windows-gnu`, `aarch64-apple-darwin`.
+- `timeout 60 cargo test --workspace`: 15 passed, 1 ignored, plus the gui crate's 1.
+- macOS/Windows test builds: compiled by the front end, cannot link here (no macOS SDK, no
+  mingw `dlltool`), same as before.
+- Linux lock detection checked against the real machine: `loginctl list-sessions
+  --no-legend` -> first column is the session id, `loginctl show-session 1 -p LockedHint`
+  -> `LockedHint=no`; on this desktop `XDG_SESSION_ID` is unset, which is why the fallback
+  parse exists. Cinnamon answers `GetActive` with `NotSupported`, which is treated as
+  "nothing to ask" rather than "locked".
+- Dead end: the black-screen report cannot be reproduced here. Two candidate causes fit
+  (prompt under the black windows, or the wrong display); the new logging distinguishes them
+  in one line.
+
+### What has to be checked on the device (beta3)
+
+1. Enrolment end to end: password, then Touch ID. It must return within 45 s at the worst,
+   with either a passkey or a "No passkey: ..." line, and the process must exit by itself.
+2. Lock screen: the prompt must be visible and focused on the display being looked at.
+3. `Ctrl+Cmd+Q` while the screen is black: Sleepless must vanish immediately, and the
+   display settings come back. Same for `Win+L` on Windows and a logind lock on Linux.
+4. Kill the process while locked (still a supported way out) and confirm the Windows heal
+   and the macOS helper release still work.
+
 ## Sources
 
 - https://learn.microsoft.com/windows/win32/api/winreg/nf-winreg-regcreatekeyexw
@@ -282,3 +386,11 @@ None of that proves the lock screens *behave*; see the checklist above.
 - https://learn.microsoft.com/windows/win32/api/webauthn/nf-webauthn-webauthnmakecredential
 - OWASP password storage guidance (PBKDF2-HMAC-SHA256 work factor):
   https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html
+- https://developer.apple.com/documentation/appkit/nsworkspace/notificationcenter
+- https://developer.apple.com/documentation/appkit/nsworkspacesessiondidresignactiveconnection
+- https://developer.apple.com/documentation/foundation/nsnotificationcenteraddobserverblock
+- https://learn.microsoft.com/windows/win32/api/wtsapi32/nf-wtsapi32-wtsregistersessionnotification
+- https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-msgwaitformultipleobjectsex
+- https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-peekmessagew
+- https://www.freedesktop.org/software/systemd/man/latest/loginctl.html
+- https://specifications.freedesktop.org/idle-inhibit-spec/latest/
