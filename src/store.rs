@@ -62,16 +62,28 @@ mod backend {
     // Our own corner of the registry.
     const SLEEPLESS_ROOT: &str = "Software\\Sleepless";
 
+    /// Which corner this process uses. Only the tests change it
+    /// (`SLEEPLESS_REGISTRY_ROOT`), so a test run writes into a throwaway key of
+    /// its own instead of reading - or overwriting - the real credential. The
+    /// unix backend has the same idea with `SLEEPLESS_CONFIG_DIR`; on Windows
+    /// there is no directory to point at.
+    fn root() -> String {
+        match std::env::var_os("SLEEPLESS_REGISTRY_ROOT") {
+            Some(chosen) if !chosen.is_empty() => chosen.to_string_lossy().into_owned(),
+            _ => SLEEPLESS_ROOT.to_string(),
+        }
+    }
+
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
     fn path(section: &str) -> String {
-        format!("{SLEEPLESS_ROOT}\\{section}")
+        format!("{}\\{section}", root())
     }
 
     pub fn location() -> String {
-        format!("HKCU\\{SLEEPLESS_ROOT}")
+        format!("HKCU\\{}", root())
     }
 
     fn open(section: &str, access: u32, create: bool) -> io::Result<HKEY> {

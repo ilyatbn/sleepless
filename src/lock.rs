@@ -341,16 +341,36 @@ mod tests {
             let _turn = TEST_STORE
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let dir =
-                std::env::temp_dir().join(format!("sleepless-test-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::env::set_var("SLEEPLESS_CONFIG_DIR", &dir);
+            #[cfg(windows)]
+            {
+                // On Windows the store is the registry, so a temporary directory
+                // means nothing there: point it at a throwaway key named for this
+                // process instead. Otherwise the tests would read whatever
+                // credential the machine already has - and write over it.
+                std::env::set_var(
+                    "SLEEPLESS_REGISTRY_ROOT",
+                    format!("Software\\Sleepless-test-{}-{tag}", std::process::id()),
+                );
+            }
+            #[cfg(not(windows))]
+            {
+                let dir = std::env::temp_dir()
+                    .join(format!("sleepless-test-{tag}-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&dir);
+                std::env::set_var("SLEEPLESS_CONFIG_DIR", &dir);
+            }
             TempStore { _turn }
         }
     }
 
     impl Drop for TempStore {
         fn drop(&mut self) {
+            #[cfg(windows)]
+            {
+                let _ = crate::store::delete(SECTION);
+                std::env::remove_var("SLEEPLESS_REGISTRY_ROOT");
+            }
+            #[cfg(not(windows))]
             if let Some(dir) = std::env::var_os("SLEEPLESS_CONFIG_DIR") {
                 let _ = std::fs::remove_dir_all(dir);
             }

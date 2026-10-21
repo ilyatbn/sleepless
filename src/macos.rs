@@ -406,8 +406,9 @@ const KEY_ESCAPE: u16 = 53;
 /// question is where the user is looking. Falls back to the first window when the
 /// pointer is somehow outside them all.
 ///
-/// The right and top edges are exclusive, which is how AppKit tiles displays: a
-/// point exactly on the shared edge belongs to the display on the left.
+/// The right and top edges are exclusive and the left and bottom inclusive, which
+/// is how AppKit tiles the coordinate spaces: a point exactly on the shared edge
+/// belongs to the display that *starts* there.
 fn pick_box_window(frames: &[NSRect], cursor: NSPoint) -> usize {
     let mut chosen = 0usize;
     for (index, frame) in frames.iter().enumerate() {
@@ -1501,8 +1502,9 @@ mod tests {
 
         assert_eq!(pick_box_window(&frames, NSPoint::new(100.0, 100.0)), 0);
         assert_eq!(pick_box_window(&frames, NSPoint::new(2000.0, 1000.0)), 1);
-        // Exactly on the shared edge belongs to the left display.
-        assert_eq!(pick_box_window(&frames, NSPoint::new(1920.0, 10.0)), 0);
+        // Exactly on the shared edge belongs to the display that starts there,
+        // because the previous display's right edge is exclusive.
+        assert_eq!(pick_box_window(&frames, NSPoint::new(1920.0, 10.0)), 1);
         assert_eq!(pick_box_window(&frames, NSPoint::new(1919.0, 10.0)), 0);
         // Off every display (a pointer yanked out mid-session) still gets a
         // window rather than nothing at all.
