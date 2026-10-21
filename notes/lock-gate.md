@@ -982,6 +982,62 @@ the restore logic, the logging and the crash reporting.
   version, and whether Touch ID at the gate behaves with our window key.
 
 
+### Device test sheet for this build (v0.2.2beta6, tag at `2aee87d`)
+
+Enrolment, from the menu bar:
+
+1. Menu bar icon -> **Set a password to come back…**. Expect: a dialog *from Sleepless
+   GUI* with "Choose a:", a secure field already focused (type immediately, no clicking),
+   OK/Cancel; then a second one to confirm. No Dock icon appears at any point.
+2. Wrong-then-right: cancel the second dialog -> "Cancelled: no password was set."
+   Mismatched entries -> "The two entries didn't match, so nothing was saved."
+3. After a successful pair: "Coming back from the black screen now needs this password."
+   then "Also allow Touch ID to come back?" -> Yes -> Apple's Touch ID panel appears
+   (this time from the tray app, which the user clicked, so it should simply work).
+4. Re-run the menu item with a password already set -> "You already have a password to
+   come back. Replace it?" first.
+5. Terminal path still works: `sleepless --set-password` in Terminal asks with echo off;
+   over ssh it also asks in the terminal. `--set-password --stdin` reads one line.
+
+Coming back:
+
+6. Eyes icon -> black screens. Move the mouse: the display the pointer is on now shows
+   "Enter your password to come back", a secure field (focused, caret visible), and a
+   status line. The pointer is visible. Other displays stay plain black.
+7. Type the wrong password, Return -> "Wrong password, try again" + back-off; type the
+   right one -> the screen comes back and the session ends.
+8. Escape clears the field and does not unlock.
+9. Two displays: put the pointer on the second one before coming back - the box must be
+   on that display.
+10. At the black screen *and* at the password box: **Ctrl+Cmd+Q** -> Sleepless exits
+    immediately and the OS lock screen appears; the display is not left black.
+11. `kill <pid>` of the session process (or **Quit Sleepless** in the tray) is still the
+    supported bypass.
+
+Log lines worth sending back (`~/Library/Logs/Sleepless/sleepless.log`, run with
+`--debug` for the full picture):
+
+- `Password box: pointer at (x, y); displays #0 …#1 …; using #N.` - which display was
+  chosen and what the frames were.
+- `Password box: window key true, field is first responder: true.` - if either is false,
+  that is the bug.
+- `Password box: Return pressed, N characters committed.` - N should be the length typed;
+  `N = 0` when something was typed means the commit didn't happen.
+- `Password box: still waiting for a password after 20s (window key: true).` - proves the
+  box was up and the pump alive.
+- `Password box: the field did not take keyboard focus.` / `No password box could be
+  shown; ending the session rather than holding the screen.` - the escape hatch: the
+  display is handed back instead of being held.
+- `Asking for activation once (…)` - once per gate, not repeatedly.
+- `Screen-lock watch: …` breadcrumbs, and `Session was taken over…` when Ctrl+Cmd+Q was
+  pressed.
+- Tray app (`~/Library/Logs/Sleepless/sleepless-gui.log`): `password dialog …: shown,
+  field focused: true`, `password dialog …: N characters typed`, `Touch ID prompt
+  requested; waiting up to 45s`, `Touch ID answered: confirmed`, `credential command
+  ["--set-password", "--stdin"]: exit Some(0)`.
+- Any `Objective-C exception thrown:` or `PANIC at` line.
+
+
 ## Sources
 
 - https://learn.microsoft.com/windows/win32/api/winreg/nf-winreg-regcreatekeyexw
