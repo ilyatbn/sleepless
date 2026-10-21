@@ -981,6 +981,41 @@ the restore logic, the logging and the crash reporting.
   front, whether `com.apple.screenIsLocked` fires for Ctrl+Cmd+Q on this macOS
   version, and whether Touch ID at the gate behaves with our window key.
 
+### Release record: v0.2.2beta6 (pre-release), tag at `a79ae40`
+
+https://github.com/ilyatbn/sleepless/releases/tag/v0.2.2beta6 - the tag was
+deleted and re-pointed twice: the first beta6 (run 16, `f2b2f2c`) built the
+superseded presenter, and the code that replaced it is what the release now
+carries (`softprops/action-gh-release` creates *or updates* the release, and
+`target_commitish` is now `a79ae40`).
+
+Getting CI green took four runs, and every failure was a real one:
+
+| Run | Outcome | Why |
+|---|---|---|
+| 18 | failure | the two new test legs failed: the multi-display assert in `pick_box_window` contradicted the (correct) edge rule, and on Windows the credential tests were reading/writing the live registry key because `SLEEPLESS_CONFIG_DIR` means nothing there |
+| 19-22 | failure ×4 | same causes at `2aee87d`/`a9b7354`; the macOS leg went green with the edge-rule fix |
+| 23 | failure | builds and tests all green (Windows included); only *Create / update release* failed - run 24 was writing the same release at the same moment |
+| 24 | **success** | version, linux ×2, windows, macos, release |
+
+Two CI hazards worth remembering: a tag push sometimes produces **no run at all**
+(the remote ref moves and nothing is scheduled - delete, wait ~200s, re-push);
+and two runs for the same tag **race on the release step**, so a failure there
+next to a green run is that race, not a build problem.
+
+Shipped binaries checked with `strings` (universal macOS build, both slices):
+
+- present in `sleepless`: `SleeplessBlackWindow`, `canBecomeKeyWindow`,
+  `Enter your password to come back`, `Password box: pointer at`,
+  `validateEditing`, `abortEditing`, `Escape does not unlock Sleepless`,
+  `Password arrived on stdin`, `--stdin`, `--confirmed`, `Sleepless 0.2.2-beta.6`;
+- present in `sleepless-gui`: `password dialog`, `field focused`,
+  `Touch ID prompt requested`, `Sleepless - new password` - the dialogs moved here;
+- **absent from both**, proving the old presenter really is gone:
+  `Lock prompt in its modal loop`, `hidesOnDeactivate`,
+  `yielded activation to pid`, `Still holding the prompt`;
+- the Linux and Windows binaries carry the same `0.2.2-beta.6`.
+
 
 ### Device test sheet for this build (v0.2.2beta6, tag at `2aee87d`)
 
