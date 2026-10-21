@@ -78,17 +78,18 @@ Driving a prompt-driven CLI command without a GUI:
   buttons own the modal loop, which is why the prompt needs no key handling of its own.
 - macOS: ObjC `BOOL` is `objc2::runtime::Bool` inside a block signature (a Rust `bool` has no
   `Encode`), the error argument has to be a raw pointer (a closure signature can't be
-  higher-ranked), `RcBlock::new` needs the target type written out, `NSDefaultRunLoopMode`
-  is an extern static (unsafe to name), and `LAContext` needs
-  `#[link(name = "LocalAuthentication", kind = "framework")]` before
-  `AnyClass::get("LAContext")` finds it at all.
-- **Waiting on a `LAContext` reply needs the AppKit event queue, not a run-mode slice.**
-  The reply block is delivered on the main queue and the prompt lives in a modal panel, so
-  `NSRunLoop::runMode_beforeDate(NSDefaultRunLoopMode, ..)` left the dialog on screen with
-  nothing servicing it and the caller stuck until it was killed. `evaluate()` now dequeues
-  and dispatches events itself (the same thing `NSApplication::run` does) and gives up after
-  `TOUCH_ID_TIMEOUT` with the `NSError` domain/code logged, so enrolment can only finish,
-  fail, or time out - never hang.
+  higher-ranked), `RcBlock::new` needs the target type written out, and `NSDefaultRunLoopMode`
+  is an extern static (unsafe to name). `LAContext` used to need a manual
+  `#[link(name = "LocalAuthentication", kind = "framework")]` so `AnyClass::get("LAContext")`
+  could find it; the typed crate links the framework itself, so that's gone.
+- **Waiting for a Touch ID answer needs the AppKit event queue, not a run-mode slice.**
+  `NSRunLoop::runMode_beforeDate(NSDefaultRunLoopMode, ..)` left the authentication panel
+  on screen with nothing servicing it and the caller stuck until it was killed, because the
+  panel is presented in our own process. `evaluate()` now dequeues and dispatches events
+  itself (the same thing `NSApplication::run` does) and gives up after `TOUCH_ID_TIMEOUT`
+  with the `NSError` domain/code logged, so enrolment can only finish, fail, or time out -
+  never hang. (The answer itself arrives on a framework-private queue - see below - so it
+  goes through an atomic, not a run-loop drain.)
 - Related: an accessory process (a tray-started helper) does not reliably get that prompt
   shown in front of it, so `passkey_enroll` flips the activation policy to `Regular` and
   activates before asking, then puts the policy back.
@@ -98,6 +99,48 @@ Driving a prompt-driven CLI command without a GUI:
   timer again with `NSRunLoop::addTimer_forMode(&timer, NSRunLoopCommonModes)`. That timer
   is what re-asserts the prompt's window level, ordering and app activation twice a second,
   because a beta ended up with the prompt behind its own black windows.
+- **`-[LAContext evaluatePolicy:localizedReason:reply:]` returns void.** Reading a `Bool`
+  out of it (`let started: Bool = msg_send![...]`) turned a leftover register into a
+  "refusal", so the passkey step failed instantly while Apple's panel was still on screen.
+  Use `objc2-local-authentication`'s typed binding - it has no return value to get wrong -
+  with features `LAContext` + `block2` (the block variant) + `LAPublicDefines`. Two traps in
+  that crate: the `kLAPolicy...` constants are `c_uint` while the methods want the
+  `LAPolicy(NSInteger)` newtype, and `msg_send_id!` is deprecated in objc2 0.6 (plain
+  `msg_send!` now converts to `Retained`).
+- Apple renders the authentication reason as `"<app name>" is trying to <localizedReason>`,
+  so the reason is a verb phrase ("set up Touch ID to unlock Sleepless"), never
+  "Sleepless: ...". A nil or empty reason throws `NSInvalidArgumentException`.
+- The reply block is documented as running on "a private queue internal to the framework",
+  with no guarantee of thread or run loop, so the answer has to arrive through something
+  thread-agnostic (an `AtomicU8`), and the waiting loop only needs the event queue for the
+  panel's own UI. Also documented: never call `canEvaluatePolicy` from inside the reply
+  block - it can deadlock.
+- **A hand-written `msg_send!` on a class with no bindings killed a release.** The
+  distributed-centre call was written out (`addObserverForName:object:queue:options:usingBlock:`,
+  `options: 0u64`, an assumed return value); Foundation throws when it dislikes a block
+  argument, an Objective-C exception cannot unwind through Rust frames, and the process
+  aborted with nothing in the log. Now: typed bindings (a `Retained::downcast` to
+  `NSNotificationCenter` checks the hierarchy), the ancient documented
+  `addObserver:selector:name:object:` through a `define_class!` subclass as the primary
+  route, and `objc2::exception::catch` where available.
+- `catch-objc-exceptions` is an off-by-default cargo feature because catching needs
+  `objc2-exception-helper`'s `.m` compiled for the target - a Linux cross-build has no
+  Objective-C compiler. The macOS CI job enables it. To type-check that path from Linux,
+  stub the toolchain: `CC_<target>=<script that touches the -o file>` plus
+  `AR_<target>=<script that touches the .a>` satisfy `cc-rs` and `cargo check` compiles the
+  Rust without linking.
+- `NSDistributedNotificationCenter` has no bindings in objc2-app-kit 0.3 (it's documented
+  under Foundation). It is an `NSNotificationCenter` subclass, which is what makes the typed
+  observer methods apply once the shared centre has been downcast to it.
+- `isKeyWindow` is false for an alert panel *before* `runModal` even when everything works
+  - a panel becomes key inside the modal loop. Measure it from a timer that fires inside
+  that loop. An accessory process can't become active either, so a dialog needs
+  `setActivationPolicy:Regular` (and both `activateIgnoringOtherApps:`, which macOS 14 may
+  ignore, and `-activate`, which doesn't exist before 14 - hence `respondsToSelector:`).
+- With `panic = "abort"` in the release profile a panic leaves the log ending mid-sentence
+  and looks like a killed process. `logging::install_panic_hook()` writes
+  `PANIC at file:line: message` straight to the log file (not through the normal sink, whose
+  lock the panic may be holding).
 - macOS session-lock signals: `NSWorkspace::sharedWorkspace().notificationCenter()` +
   `addObserverForName_object_queue_usingBlock` only exists in the bindings with foundation
   features `NSNotification`, `NSOperation`, `NSString` and `block2`, and the returned token

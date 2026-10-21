@@ -142,6 +142,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let opts = parse_args();
     platform::init_logging(opts.debug);
+    logging::install_panic_hook();
     DEBUG.store(opts.debug, Ordering::Relaxed);
     log!(
         "Sleepless {} starting (pid {}), args {args:?}, options: {opts:?}; logging to {:?}",

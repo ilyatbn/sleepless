@@ -51,6 +51,36 @@ pub fn path() -> PathBuf {
     state.join("sleepless").join("sleepless.log")
 }
 
+/// Writes the panic to the log before the process aborts, so a crash in a
+/// `panic = "abort"` release build leaves a last line naming what died. Goes
+/// straight to the file: the panic may have happened while the log's own lock
+/// was held.
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let what = match info.payload().downcast_ref::<&str>() {
+            Some(s) => (*s).to_string(),
+            None => info
+                .payload()
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_else(|| "no message".to_string()),
+        };
+        let where_ = match info.location() {
+            Some(l) => format!("{}:{}", l.file(), l.line()),
+            None => "unknown place".to_string(),
+        };
+        let line = format!("PANIC at {where_}: {what}");
+        let target = path();
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&target) {
+            let _ = writeln!(file, "{} {line} - aborting.", stamp());
+        }
+        eprintln!("Sleepless: {line}");
+    }));
+}
+
 pub fn note(msg: &str) {
     let target = path();
     let mut guard = match LOG.lock() {

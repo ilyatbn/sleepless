@@ -13,6 +13,7 @@
 // $SLEEPLESS_LOG overrides the path (the tests use that, and it lets a build
 // be tried without touching the real log).
 
+use std::any::Any;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -75,6 +76,47 @@ fn home() -> Option<PathBuf> {
 
 /// Appends one timestamped line. A logging failure is never fatal: it's
 /// mentioned once on stderr and then left alone.
+/// Formats what a panic was about: where it happened and what it said. The
+/// payload is a `&str` for `panic!("literal")` and a `String` for anything
+/// formatted, so both are handled.
+pub fn panic_message(payload: &(dyn Any + Send), where_: Option<&std::panic::Location>) -> String {
+    let what = match payload.downcast_ref::<&str>() {
+        Some(s) => (*s).to_string(),
+        None => payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_else(|| "no message".to_string()),
+    };
+    let where_ = match where_ {
+        Some(l) => format!("{}:{}", l.file(), l.line()),
+        None => "unknown place".to_string(),
+    };
+    format!("PANIC at {where_}: {what}")
+}
+
+/// A panic in the release build (which is `panic = "abort"`) otherwise leaves
+/// the log ending mid-sentence, which reads like a killed process rather than
+/// a bug. This writes the panic to the log file before the abort, going
+/// straight to the file instead of through the usual sink - the panic may have
+/// happened while that sink's lock was held.
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let line = panic_message(info.payload(), info.location());
+        let target = path();
+        if let Some(parent) = target.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&target) {
+            let _ = writeln!(
+                file,
+                "{} {line} - aborting the run.",
+                stamp(SystemTime::now())
+            );
+        }
+        eprintln!("Sleepless: {line}");
+    }));
+}
+
 pub fn note(msg: &str) {
     let target = path();
     let line = format!("{} {msg}\n", stamp(SystemTime::now()));
@@ -172,6 +214,26 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_panic_names_the_place_and_the_reason() {
+        let exploded = std::panic::catch_unwind(|| panic!("the credential store is gone"));
+        let payload = exploded.unwrap_err();
+        let message = panic_message(payload.as_ref(), None);
+        assert_eq!(
+            message,
+            "PANIC at unknown place: the credential store is gone"
+        );
+
+        // A formatted panic arrives as a String instead of a &'static str.
+        let name = "caffeinate";
+        let exploded = std::panic::catch_unwind(move || panic!("could not start {name}"));
+        let payload = exploded.unwrap_err();
+        assert_eq!(
+            panic_message(payload.as_ref(), None),
+            "PANIC at unknown place: could not start caffeinate"
+        );
+    }
+
     use super::*;
     use std::time::Duration;
 

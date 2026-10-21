@@ -487,6 +487,9 @@ fn run_event_loop() {
 }
 
 fn main() {
+    // A release build aborts on a panic; make sure the log says so, with the
+    // place and the reason, instead of just stopping.
+    log::install_panic_hook();
     if already_running() {
         log::note("another tray icon is already running for this user; exiting");
         return;

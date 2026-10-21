@@ -285,10 +285,12 @@ Status: fixed, most likely cause identified.
 - `evaluate()` asked `LAContext` for the prompt and then waited by running the run loop in
   `NSDefaultRunLoopMode` in 0.1 s slices, polling a channel for the reply. On the device the
   prompt appeared and then nothing ever came back, so the process sat until it was killed.
-- What that shape means: the reply block is dispatched on the main queue, and the prompt
-  itself is a modal panel, which AppKit services in `NSModalPanelRunLoopMode`. A loop that
-  only ever runs the default mode drains neither of them reliably - the panel is on screen
-  but unreachable, so the block never runs.
+- What that shape means: the prompt is a panel AppKit presents in *our* process, and a
+  loop that only runs `NSDefaultRunLoopMode` in slices never services it - the panel is on
+  screen but unreachable, so nothing completes and the block never runs. (Correction from
+  beta4: the docs say the reply block runs "on a private queue internal to the framework",
+  with no guarantee of queue, thread or run loop - so the answer must not depend on
+  draining any particular queue. It goes into an atomic slot for exactly that reason.)
 - Fix: wait the way `NSApplication::run` does - `nextEventMatchingMask:untilDate:inMode:
   dequeue:` (0.1 s slices) + `sendEvent:` - so the prompt's own UI and the main queue are
   both serviced. The answer lands in a static `AtomicU8` (0 waiting / 1 yes / 2 no) instead
@@ -393,6 +395,150 @@ guaranteed way out of Sleepless - which is also the answer to a stuck prompt.
 4. Kill the process while locked (still a supported way out) and confirm the Windows heal
    and the macOS helper release still work.
 
+## beta4: three reports from the device (2026-10-21)
+
+`v0.2.2beta3` was worse on the machine than here: Touch ID gave up instantly, and every
+"turn display off" run died at startup (`session process finished:
+Ok(ExitStatus(unix_wait_status(6)))` = SIGABRT).
+
+### Bug A: the Touch ID request was treated as a failure the moment it started
+
+Status: fixed, and the cause is certain.
+
+- `-[LAContext evaluatePolicy:localizedReason:reply:]` returns **void**. The call was
+  written as `let started: Bool = msg_send![...]`, so a leftover register was read as a
+  BOOL, came back 0, and `evaluate()` returned false in the same second the system panel
+  appeared. The log showed exactly that: "Asking the system to confirm your identity..."
+  immediately followed by "LocalAuthentication refused to start the Touch ID request at
+  all.", and the "No passkey" alert went up beside Apple's panel while it was still
+  waiting for a finger.
+- Fix: `objc2-local-authentication` (typed LAContext bindings) whose
+  `evaluatePolicy_localizedReason_reply` returns `()`, so the mistake is impossible. The
+  reply block is the only outcome channel and is now always waited for (still capped by
+  `TOUCH_ID_TIMEOUT`, and the context is `invalidate()`d on timeout so a stale panel can't
+  linger).
+- `localizedReason` wording: Apple renders "<app> is trying to <reason>", so the strings
+  are now "set up Touch ID to unlock Sleepless" and "unlock Sleepless". The app name in
+  that sentence is the process/bundle name, which is why it reads "sleepless is trying
+  to..." for the bare binary and "Sleepless ..." inside the .app bundle.
+
+### Bug B: the session process aborted before the black windows existed
+
+Status: fixed as far as the evidence allows, with several independent layers.
+
+- The log stopped at "Watching for the session being resigned (NSWorkspace)." and every
+  branch of `watch_screen_is_locked()` logs except one, so the abort was inside it. The
+  crash report was SIGABRT with `abort()` called from our own frames and no
+  `lastExceptionBacktrace`.
+- Most likely mechanism, and the reason the fix is what it is: that function hand-wrote
+  `msg_send![center, addObserverForName:object:queue:options:usingBlock:]` - invented
+  argument types (`options: 0u64`), a block parameter typed `NonNull<NSNotification>` by
+  guesswork, and an assumed return value. Foundation validates block arguments and throws
+  `NSInvalidArgumentException` when it doesn't like one; an Objective-C exception cannot
+  unwind through Rust frames, so the process aborts. No Rust panic is involved, so nothing
+  was logged.
+- Layers of fix:
+  1. The subscription now uses objc2-foundation's **typed** bindings, reached through a
+     runtime-checked `downcast` of the shared centre to `NSNotificationCenter` (the
+     distributed centre is that subclass, which is what makes the observer methods apply).
+  2. Primary registration is the oldest documented form,
+     `-addObserver:selector:name:object:`, aimed at a small `LockWatcher` NSObject subclass
+     defined with `define_class!`; the block observer is only the fallback.
+  3. Both attempts run inside `try_objc`, which is `objc2::exception::catch` when the
+     `catch-objc-exceptions` feature is on, so an exception becomes a log line. That
+     feature is **off by default and on in the macOS CI job**: catching means compiling
+     `objc2-exception-helper`'s `.m` file for the target, and a Linux cross-build has no
+     Objective-C compiler. (Checked locally with stub `CC_`/`AR_` scripts that satisfy
+     `cc-rs` without linking - enough to type-check the catching path, which is the only
+     way to see it at all from here.)
+  4. The distributed watcher now runs **after** `black_out`, so even a fatal problem there
+     cannot stop the display going off; the workspace watcher (which was already the typed
+     API, and demonstrably worked) still runs before it.
+  5. A panic hook in both binaries writes `PANIC at <file>:<line>: <message> - aborting the
+     run.` to the log file straight past the normal sink (the panic may hold that lock).
+     With `panic = "abort"` in the release profile that is otherwise invisible, which is
+     exactly the "silent death" shape of this bug.
+
+### The rest of the report
+
+- `key window: false` on every dialog: measured wrong rather than broken. A panel becomes
+  key *inside* the modal loop, so `isKeyWindow` is false at the point it was being logged.
+  The presenter now also sets the activation policy to `Regular` for the duration (an
+  accessory process cannot become active, and a window cannot be key in an app that isn't),
+  unhides the app, calls both activation APIs, and calls `makeKeyAndOrderFront` before the
+  modal loop. The keep-on-top timer now reports the key state from inside the loop - on the
+  first tick and on every change - which is the measurement that means something.
+- Version: `Cargo.toml` and `gui/Cargo.toml` now say `0.2.2-beta.4` so the log line and the
+  release name agree. (Verified in beta3's own log: it printed 0.3.0 while the tag said
+  v0.2.2beta3.)
+
+### Objective-C call audit (everything in src/macos.rs)
+
+Hand-written `msg_send!` - three, all documented, all with the declaration checked against
+the Apple headers / the objc2 generated bindings:
+
+| Call | Apple declaration | Return | Notes |
+| --- | --- | --- | --- |
+| `[NSDistributedNotificationCenter distributedNotificationCenter]` | `+ (NSDistributedNotificationCenter *)distributedNotificationCenter;` | object pointer, taken with `Retained::retain` | no arguments; only hand-written because objc2-app-kit 0.3 has no bindings for this class |
+| `[app respondsToSelector:@selector(activate)]` | `- (BOOL)respondsToSelector:(SEL)aSelector;` (NSObject) | `BOOL` -> `objc2::runtime::Bool` | guard for the macOS 14 `-activate` |
+| `[LockWatcher class] new` | `+ (instancetype)new;` (NSObject, init family) | converted to `Retained<LockWatcher>` by `msg_send!` | `msg_send_id!` is deprecated in objc2 0.6; plain `msg_send!` does the conversion |
+
+Everything else is a generated binding, i.e. the signature came from the headers rather
+than from me. The ones worth naming, with the Objective-C declaration they mirror:
+
+| Binding | Declaration |
+| --- | --- |
+| `LAContext::new()` | `+ (instancetype)new;` / `- (instancetype)init;` |
+| `canEvaluatePolicy_error(BIOMETRICS) -> Result<(), Retained<NSError>>` | `- (BOOL)canEvaluatePolicy:(LAPolicy)policy error:(NSError * _autoreleasing *)error;` |
+| `evaluatePolicy_localizedReason_reply(LAPolicy, &NSString, &DynBlock<dyn Fn(Bool, *mut NSError)>)` | `- (void)evaluatePolicy:(LAPolicy)policy localizedReason:(NSString *)localizedReason reply:(void (^)(BOOL success, NSError * _Nullable error))reply;` - **void**, the bug |
+| `invalidate()` | `- (void)invalidate;` |
+| `NSWorkspace::sharedWorkspace()` | `+ (NSWorkspace *)sharedWorkspace;` (no main-thread marker in these bindings) |
+| `notificationCenter()` | `- (NSNotificationCenter *)notificationCenter;` |
+| `addObserverForName_object_queue_usingBlock(name, None, None, &block) -> Retained<ProtocolObject<dyn NSObjectProtocol>>` | `- (id<NSObject>)addObserverForName:(NSNotificationName)name object:(id _Nullable)obj queue:(NSOperationQueue * _Nullable)queue usingBlock:(void (^)(NSNotification * _Nullable note))block;` |
+| `addObserver_selector_name_object(&observer, sel!(...), Some(&name), None)` | `- (void)addObserver:(NSObject *)observer selector:(SEL)aSelector name:(NSNotificationName _Nullable)aName object:(id _Nullable)anObject;` |
+| our `sleeplessSessionLockChanged:` | implemented on a `define_class!` subclass; one object argument, returns void, matching the selector the observer is registered with |
+| `NSApplication::{sharedApplication, activationPolicy, setActivationPolicy:, unhide:, activateIgnoringOtherApps: -> BOOL, activate}` | `-activate` is macOS 14+, which is why it is behind `respondsToSelector:` |
+| `NSWindow::{level, setLevel:, setCollectionBehavior:, setFrame_display:, makeKeyAndOrderFront:, orderFrontRegardless, isKeyWindow -> BOOL, makeFirstResponder: -> BOOL, firstResponder, title, frame}` | as generated |
+| `NSApp nextEventMatchingMask_untilDate_inMode_dequeue -> Option<Retained<NSEvent>>`, `sendEvent:` | `- (nullable NSEvent *)nextEventMatchingMask:...` and `- (void)sendEvent:` |
+| `NSTimer::scheduledTimerWithTimeInterval_repeats_block`, `NSRunLoop::addTimer_forMode`, `invalidate` | `- (void)addTimer:(NSTimer *)timer forMode:(NSRunLoopMode)mode;` |
+| `NSEvent::mouseLocation() -> NSPoint`, `NSScreen::screens(mtm)` | `+ (NSPoint)mouseLocation;`, `+ (NSArray<NSScreen *> *)screens;` |
+| `NSError::{code -> NSInteger, domain, localizedDescription}` | used to log the LocalAuthentication refusal |
+| `NSNotification::name()` | `- (NSNotificationName)name;` |
+
+Two binding details that matter when reading the code: `NSNotificationName` is a Rust
+typealias for `NSString`, and `LAPolicy` is a newtype over `NSInteger` (the
+`kLAPolicy...` constants exported by the crate are `c_uint`, which is the wrong width -
+use `LAPolicy::DeviceOwnerAuthenticationWithBiometrics`).
+
+### Verification done here (beta4)
+
+- `cargo check --workspace` clean on `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-gnu`,
+  `aarch64-apple-darwin` **and** `x86_64-apple-darwin` (the macOS job builds both arches;
+  earlier checks had only covered aarch64).
+- Same for `--features catch-objc-exceptions` with stubbed `CC`/`AR`: the catching path
+  type-checks.
+- `timeout 60 cargo test --workspace`: 16 passed, 1 ignored, plus the gui crate's 1. New
+  test: `a_panic_names_the_place_and_the_reason` (both the `&str` and the `String` panic
+  payload shapes).
+- Test builds for the darwin and windows targets: no front-end errors (linking still
+  impossible here).
+- Dead end worth recording: the SIGABRT cannot be reproduced or observed from here - no
+  Objective-C runtime, and the crash report is the only witness. That is why beta4's
+  answer is "several independent layers plus a panic hook" rather than one root cause.
+
+### What has to be checked on the device (beta4)
+
+1. Enrolment: Touch ID must actually wait for the finger (log shows
+   "Touch ID request handed to the system; waiting up to 45s..." and then either
+   "Touch ID answered: confirmed." or an answer with an error code).
+2. "Turn display off" must produce black windows and keep the display awake; the log must
+   reach "Blacked out N display(s)." and then the watcher line.
+3. Coming back: the prompt visible, on the display under the pointer, and the timer line
+   must say `key window: true`.
+4. `Ctrl+Cmd+Q` / fast user switch: immediate exit, with either the
+   "Distributed notification ..." or "Session notification ..." line.
+5. If anything still dies, the log should end with a `PANIC at ...` line.
+
 ## Sources
 
 - https://learn.microsoft.com/windows/win32/api/winreg/nf-winreg-regcreatekeyexw
@@ -411,3 +557,10 @@ guaranteed way out of Sleepless - which is also the answer to a stuck prompt.
 - https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-peekmessagew
 - https://www.freedesktop.org/software/systemd/man/latest/loginctl.html
 - https://specifications.freedesktop.org/idle-inhibit-spec/latest/
+- https://developer.apple.com/documentation/localauthentication/lacontext/1514176-evaluatepolicy
+- https://developer.apple.com/documentation/foundation/nsnotificationcenter/addobserverforname-object-queue-usingblock
+- https://developer.apple.com/documentation/appkit/nsdistributednotificationcenter
+- https://docs.rs/objc2-local-authentication/latest/objc2_local_authentication/struct.LAContext.html
+- https://docs.rs/objc2/latest/objc2/exception/fn.catch.html
+- https://objc2.objcs.io/objc2/ (define_class!, msg_send! Retained conversion)
+- https://developer.apple.com/documentation/appkit/nsapplication/activate()

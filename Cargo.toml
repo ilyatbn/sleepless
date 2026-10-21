@@ -1,6 +1,6 @@
 [package]
 name = "sleepless"
-version = "0.3.0"
+version = "0.2.2-beta.4"
 edition = "2021"
 
 [[bin]]
@@ -26,12 +26,21 @@ panic = "abort"
 # Salted password hashing for the "come back" prompt (src/lock.rs) plus the OS
 # random number generator for its salt. Both are pure Rust and build for every
 # platform we ship.
+[features]
+# Turns an Objective-C exception into a log line instead of an abort. Off by
+# default: catching needs an Objective-C compiler for the target
+# (objc2-exception-helper), which a Linux cross-build doesn't have, so the
+# macOS CI job switches it on.
+catch-objc-exceptions = ["objc2/exception"]
+
 [dependencies]
 pbkdf2 = { version = "0.13", features = ["sha2"] }
 getrandom = "0.4"
 
 # The black full-screen windows and the password prompts on macOS.
 [target.'cfg(target_os = "macos")'.dependencies]
+# "exception" gives objc2::exception::catch, which turns an Objective-C exception into
+# a log line instead of an abort.
 objc2 = "0.6"
 # LocalAuthentication hands its result back in an Objective-C block.
 block2 = "0.6"
@@ -67,6 +76,15 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSGeometry",
     "NSRunLoop",
     "NSString",
+] }
+# Typed LAContext bindings: -evaluatePolicy:localizedReason:reply: returns void, and only
+# the bindings can say so. Needs "block2" for the reply block and "LAPublicDefines"
+# for the LAPolicy constants.
+objc2-local-authentication = { version = "0.3", default-features = false, features = [
+    "LAContext",
+    "LAPublicDefines",
+    "LAError",
+    "block2",
 ] }
 
 [target.'cfg(windows)'.dependencies]

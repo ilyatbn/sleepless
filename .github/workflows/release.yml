@@ -76,9 +76,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build universal binaries
+        # catch-objc-exceptions turns an Objective-C exception into a logged
+        # failure instead of an abort. It needs an Objective-C compiler for the
+        # target, so it can only be built here, on a Mac - hence it's a feature
+        # and the macOS job is the one that turns it on.
         run: |
-          cargo build --release --workspace --target aarch64-apple-darwin
-          cargo build --release --workspace --target x86_64-apple-darwin
+          cargo build --release --workspace --target aarch64-apple-darwin --features sleepless/catch-objc-exceptions
+          cargo build --release --workspace --target x86_64-apple-darwin --features sleepless/catch-objc-exceptions
           mkdir -p dist
           for bin in sleepless sleepless-gui; do
             lipo -create -output "dist/$bin" \
