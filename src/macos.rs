@@ -22,15 +22,18 @@
 // ~/Library/Services.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::{env, fs, io, thread};
 
 use objc2::rc::Retained;
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSCursor, NSScreen,
-    NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSAlert, NSAlertStyle, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType,
+    NSColor, NSCursor, NSEventMask, NSModalResponseOK, NSScreen, NSSecureTextField, NSWindow,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
 };
+use objc2_foundation::NSDefaultRunLoopMode;
 
 use crate::unix::{self, fail, run_ok, run_output, spawn, spawn_as_root, wait_for_our_exit_sh};
 
@@ -38,6 +41,11 @@ pub use crate::unix::{debug_log, init_logging};
 
 // NSScreenSaverWindowLevel: above the menu bar, Dock and full-screen apps.
 const SCREEN_SAVER_WINDOW_LEVEL: isize = 1000;
+
+/// Set by the thread watching for input once the user is back.
+static BACK: AtomicBool = AtomicBool::new(false);
+/// Set by the main thread once the password has been typed correctly.
+static UNLOCKED: AtomicBool = AtomicBool::new(false);
 
 // kCGEventSourceStateHIDSystemState / kCGAnyInputEventType
 const HID_SYSTEM_STATE: i32 = 1;
@@ -162,6 +170,283 @@ fn sleep_disabled() -> Option<bool> {
         .and_then(|f| f.get(1).map(|v| *v == "1"))
 }
 
+// ---------------------------------------------------------------------
+// Asking for the credential
+//
+// An NSAlert with a secure text field as its accessory view: the alert's own
+// buttons run the modal loop, so Return accepts and Escape cancels without us
+// having to look at key events, and the field never echoes what's typed.
+// ---------------------------------------------------------------------
+
+use crate::lock::{self, Secret};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+
+/// The alert panel we're currently showing, if any, so the lock screen can
+/// raise it above the black windows.
+fn raise_above_black_out(window: &NSWindow) {
+    window.setLevel(SCREEN_SAVER_WINDOW_LEVEL + 1);
+    window.setCollectionBehavior(
+        NSWindowCollectionBehavior::CanJoinAllSpaces
+            | NSWindowCollectionBehavior::Stationary
+            | NSWindowCollectionBehavior::FullScreenAuxiliary
+            | NSWindowCollectionBehavior::IgnoresCycle,
+    );
+}
+
+/// Builds the alert and its secure field, shared by the enrolment prompt and
+/// the lock screen. Without a cancel button there is no way out of the lock
+/// screen except typing the password.
+fn secret_alert(
+    mtm: MainThreadMarker,
+    title: &str,
+    message: &str,
+    cancel_button: bool,
+) -> (Retained<NSAlert>, Retained<NSSecureTextField>) {
+    let alert = NSAlert::new(mtm);
+    alert.setAlertStyle(NSAlertStyle::Warning);
+    alert.setMessageText(&NSString::from_str(message));
+    // The first button is the default one, so Return is what submits it.
+    alert.addButtonWithTitle(&NSString::from_str(if cancel_button {
+        "OK"
+    } else {
+        "Come back"
+    }));
+    if cancel_button {
+        alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    }
+
+    let field = NSSecureTextField::new(mtm);
+    field.setFrame(NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(280.0, 24.0),
+    ));
+    alert.setAccessoryView(Some(&field));
+
+    let window = alert.window();
+    window.setTitle(&NSString::from_str(title));
+    window.makeFirstResponder(Some(&field));
+    (alert, field)
+}
+
+/// Asks for a secret. None when the user cancelled.
+pub fn prompt_secret(title: &str, message: &str) -> Option<Secret> {
+    let mtm = MainThreadMarker::new()?;
+    let app = NSApplication::sharedApplication(mtm);
+    let policy = app.activationPolicy();
+    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    #[allow(deprecated)] // activate() is macOS 14+; this still works there
+    app.activateIgnoringOtherApps(true);
+
+    let (alert, field) = secret_alert(mtm, title, message, true);
+    let answer = alert.runModal();
+    app.setActivationPolicy(policy);
+    (answer == NSModalResponseOK).then(|| Secret::new(field.stringValue().to_string().trim_end()))
+}
+
+/// The lock screen's prompt: the same field, but on top of the black windows
+/// and with no Cancel button.
+fn prompt_secret_locked(title: &str, message: &str) -> Option<Secret> {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return None;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    #[allow(deprecated)] // activate() is macOS 14+; this still works there
+    app.activateIgnoringOtherApps(true);
+    let (alert, field) = secret_alert(mtm, title, message, false);
+    raise_above_black_out(&alert.window());
+    let answer = alert.runModal();
+    (answer == NSModalResponseOK).then(|| Secret::new(field.stringValue().to_string().trim_end()))
+}
+
+/// One-line result message for the credential commands.
+pub fn report(message: &str) {
+    notify("Sleepless", message);
+}
+
+/// Enrolment asks through the same dialog: there's no terminal path here.
+pub fn prompt_secret_interactive(title: &str, message: &str) -> Option<Secret> {
+    prompt_secret(title, message)
+}
+
+pub fn notify(title: &str, message: &str) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        eprintln!("Sleepless: {message}");
+        return;
+    };
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str(title));
+    alert.setInformativeText(&NSString::from_str(message));
+    alert.addButtonWithTitle(&NSString::from_str("OK"));
+    alert.runModal();
+}
+
+pub fn ask_yes_no(title: &str, message: &str) -> bool {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str(title));
+    alert.setInformativeText(&NSString::from_str(message));
+    // The first button is the default one, so it's what Return gives us.
+    alert.addButtonWithTitle(&NSString::from_str("Yes"));
+    alert.addButtonWithTitle(&NSString::from_str("No"));
+    alert.runModal() == NSModalResponseOK
+}
+
+/// Runs AppKit's event queue by hand until `stop` says so.
+///
+/// `NSApplication::run()` would do this, but it never gives us a chance to
+/// notice that the thread watching for input saw the user come back, and the
+/// password prompt has to be shown on the main thread.
+fn pump_events_until(mtm: MainThreadMarker, stop: impl Fn() -> bool) {
+    let app = NSApplication::sharedApplication(mtm);
+    while !stop() {
+        while let Some(event) = unsafe {
+            app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                NSEventMask::Any,
+                None,
+                NSDefaultRunLoopMode,
+                true,
+            )
+        } {
+            app.sendEvent(&event);
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+}
+
+// ---------------------------------------------------------------------
+// Passkey: Touch ID, through LocalAuthentication
+//
+// The system does the verifying, so Sleepless holds no credential material
+// that could be stolen or got wrong: enrolling just records that a passkey is
+// allowed for this user, and coming back asks the system whether the person at
+// the keyboard is them. It never goes through the lock screen - the Touch ID
+// dialog is an ordinary prompt inside our own session, so the VPN and
+// everything else stays up.
+//
+// Anything that doesn't work - no Touch ID, the prompt cancelled, a system
+// that refuses to talk to us - falls through to the password, which is always
+// enrolled first.
+// ---------------------------------------------------------------------
+
+use std::ptr;
+use std::sync::mpsc::{self, TryRecvError};
+use std::time::Instant;
+
+use block2::RcBlock;
+use objc2::msg_send;
+use objc2::runtime::{AnyClass, AnyObject, Bool};
+use objc2_foundation::{NSDate, NSError, NSRunLoop};
+
+// LocalAuthentication isn't loaded by default; linking it makes dyld bring it
+// in so AnyClass::get("LAContext") finds it.
+#[link(name = "LocalAuthentication", kind = "framework")]
+extern "C" {}
+
+/// LAPolicyDeviceOwnerAuthenticationWithBiometrics: fingerprint only. Using
+/// the wider device-owner policy would quietly accept the account password
+/// instead, and that's the OS credential, not a Sleepless one.
+const LA_POLICY_BIOMETRICS: isize = 1;
+
+fn la_context() -> Option<Retained<AnyObject>> {
+    let cls: &AnyClass = AnyClass::get(c"LAContext")?;
+    let allocated: *mut AnyObject = unsafe { msg_send![cls, alloc] };
+    let initialised: *mut AnyObject = unsafe { msg_send![allocated, init] };
+    unsafe { Retained::from_raw(initialised) }
+}
+
+fn can_evaluate(ctx: &AnyObject, policy: isize) -> bool {
+    let mut error: *mut AnyObject = ptr::null_mut();
+    let ok: Bool = unsafe { msg_send![ctx, canEvaluatePolicy: policy, error: &mut error] };
+    ok.as_bool()
+}
+
+/// Shows the system's Touch ID prompt and waits for it. The reply block runs
+/// on the main queue, which is this thread, so the run loop is pumped until
+/// the answer arrives - or the sensor gives up and we ask for the password.
+fn evaluate(ctx: &AnyObject, policy: isize, reason: &str) -> bool {
+    let (sender, receiver) = mpsc::sync_channel::<bool>(1);
+    // ObjC's BOOL has to travel as objc2's Bool inside a block signature, and
+    // the error arrives as a plain pointer (a reference in a closure signature
+    // can't be made higher-ranked, which is what the block wants).
+    let block: RcBlock<dyn Fn(Bool, *mut NSError)> =
+        RcBlock::new(move |ok: Bool, _error: *mut NSError| {
+            let _ = sender.send(ok.as_bool());
+        });
+    let reason = NSString::from_str(reason);
+    let started: Bool = unsafe {
+        msg_send![ctx, evaluatePolicy: policy, localizedReason: &*reason, reply: &*block]
+    };
+    if !started.as_bool() {
+        log!("LocalAuthentication refused to start the Touch ID request.");
+        return false;
+    }
+    let run_loop = NSRunLoop::mainRunLoop();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < deadline {
+        match receiver.try_recv() {
+            Ok(ok) => return ok,
+            Err(TryRecvError::Disconnected) => return false,
+            Err(TryRecvError::Empty) => {}
+        }
+        let until = NSDate::dateWithTimeIntervalSinceNow(0.1);
+        // NSDefaultRunLoopMode is an extern static, hence the unsafe.
+        unsafe { run_loop.runMode_beforeDate(NSDefaultRunLoopMode, &until) };
+    }
+    log!("Touch ID request timed out; falling back to the password.");
+    false
+}
+
+/// The passkey this machine can offer, named the way Apple names it.
+pub fn passkey_supported() -> Option<&'static str> {
+    let ctx = la_context()?;
+    if can_evaluate(&ctx, LA_POLICY_BIOMETRICS) {
+        Some("Touch ID")
+    } else {
+        None
+    }
+}
+
+/// Asks the system once, so a machine that can't do this finds out now rather
+/// than at the lock screen.
+pub fn passkey_enroll() -> Result<&'static str, String> {
+    let Some(label) = passkey_supported() else {
+        return Err("no usable Touch ID on this machine".to_string());
+    };
+    let ctx = la_context().ok_or_else(|| "LocalAuthentication is not available".to_string())?;
+    if evaluate(
+        &ctx,
+        LA_POLICY_BIOMETRICS,
+        "Sleepless: allow Touch ID to come back",
+    ) {
+        Ok(label)
+    } else {
+        Err("Touch ID did not confirm your identity".to_string())
+    }
+}
+
+/// What the lock screen tries before it shows the password box.
+fn passkey_unlock() -> bool {
+    let Some(ctx) = la_context() else {
+        return false;
+    };
+    if !can_evaluate(&ctx, LA_POLICY_BIOMETRICS) {
+        log!("A passkey is enrolled but Touch ID isn't available right now.");
+        return false;
+    }
+    // The system's prompt only appears in front of an active app.
+    if let Some(mtm) = MainThreadMarker::new() {
+        #[allow(deprecated)] // activate() is macOS 14+; this still works there
+        NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+    }
+    evaluate(
+        &ctx,
+        LA_POLICY_BIOMETRICS,
+        "Sleepless is keeping the display off",
+    )
+}
+
 pub fn run(opts: crate::Options) {
     install_quick_actions();
 
@@ -201,14 +486,43 @@ pub fn run(opts: crate::Options) {
 
     // --- 4. Wait for the user to come back ---
     // AppKit needs the main thread to keep the windows up, so the waiting
-    // happens on another one, which also ends the process.
+    // happens on another one, which also ends the process. With a password
+    // enrolled that thread only announces the return: the prompt has to be
+    // shown on the main thread, and nothing is released until it's answered.
+    let enrolled = lock::is_enrolled();
+    if enrolled {
+        log!("A password is enrolled: coming back will need it.");
+    }
     thread::spawn(move || {
         unix::wait_for_activity(|| Some(seconds_since_input()));
+        BACK.store(true, Ordering::SeqCst);
+        if enrolled {
+            log!("Welcome back - the password comes first.");
+            while !UNLOCKED.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
         log!("Welcome back - releasing the no-sleep assertion.");
         let _ = caffeinate.kill();
         let _ = caffeinate.wait();
         log!("Done. Exiting.");
         std::process::exit(0);
     });
-    NSApplication::sharedApplication(mtm).run();
+
+    if enrolled {
+        pump_events_until(mtm, || BACK.load(Ordering::SeqCst));
+        // Touch ID first if it was enrolled; the password is the way back when
+        // the sensor isn't available or the person would rather type.
+        if lock::has_passkey() && passkey_unlock() {
+            log!("Passkey accepted.");
+        } else {
+            lock::unlock_loop(|message| prompt_secret_locked("Sleepless", message));
+        }
+        UNLOCKED.store(true, Ordering::SeqCst);
+        // The waiting thread does the cleanup and exits; keep the windows up
+        // (and the events flowing) until it does.
+        pump_events_until(mtm, || false);
+    } else {
+        NSApplication::sharedApplication(mtm).run();
+    }
 }

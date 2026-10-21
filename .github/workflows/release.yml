@@ -2,7 +2,11 @@ name: Build and Release
 
 on:
   push:
+    # A push to main publishes v<Cargo.toml version>; pushing a tag publishes
+    # exactly that tag, which is how a beta (v0.2.2beta1) gets built without
+    # pretending the version in Cargo.toml has changed.
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
     inputs:
@@ -161,16 +165,36 @@ jobs:
 
       - run: ls -la dist
 
+      - name: Work out which release this run publishes
+        id: tag
+        run: |
+          # A tag push publishes that exact tag; a manual run can name one;
+          # a push to main uses v<Cargo.toml version>.
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="${{ inputs.tag }}"
+            [[ -n "$tag" ]] || tag="v${{ needs.version.outputs.version }}"
+          fi
+          # Anything carrying a pre-release marker stays off "Latest".
+          prerelease=false
+          case "$tag" in
+            *alpha* | *beta* | *rc* | *pre* | *dev*) prerelease=true ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "publishing $tag (pre-release: $prerelease)"
+
       - name: Create / update release
         uses: softprops/action-gh-release@v2
         with:
           # A manual run with a custom tag (e.g. a beta from a feature
           # branch) is published as a pre-release on that exact commit and
           # doesn't become "Latest".
-          tag_name: ${{ inputs.tag || format('v{0}', needs.version.outputs.version) }}
-          name: Sleepless ${{ inputs.tag || format('v{0}', needs.version.outputs.version) }}
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Sleepless ${{ steps.tag.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          prerelease: ${{ inputs.tag != '' && inputs.tag != null }}
-          make_latest: ${{ (inputs.tag == '' || inputs.tag == null) && 'true' || 'false' }}
+          prerelease: ${{ steps.tag.outputs.prerelease }}
+          make_latest: ${{ steps.tag.outputs.prerelease == 'false' }}
           generate_release_notes: true
           files: dist/*

@@ -266,6 +266,13 @@ pub fn run(opts: crate::Options) {
         }
     }
 
+    // --- 3.5 Password gate ---
+    // The display is back and the desktop is visible: hold the session open
+    // until the password is typed. See the notes in unlock_gate().
+    if returned && lock::is_enrolled() {
+        unlock_gate();
+    }
+
     // --- 4. Restore ---
     match backend {
         Backend::Gnome if turned_off => {
@@ -280,4 +287,187 @@ pub fn run(opts: crate::Options) {
         _ => {}
     }
     log!("Display restored - releasing the inhibitor lock.");
+}
+
+/// Asks for the password until it's right (the shared loop lives in
+/// src/lock.rs).
+///
+/// On Linux this is a prompt, not a covered screen: the compositor decides
+/// when DPMS comes back, so the desktop is already visible by the time we can
+/// ask. It's a deterrent against whoever is sitting at the keyboard, and
+/// cancelling keeps you locked out rather than letting you through. Killing
+/// Sleepless is always a way out (the inhibitor lock is held by a helper that
+/// goes away with the process), which is deliberate: the OS lock screen is the
+/// thing to use when a real boundary is needed.
+fn unlock_gate() {
+    log!("A password is enrolled: asking before restoring the power settings.");
+    lock::unlock_loop(|message| prompt_secret("Sleepless", message));
+    log!("Password accepted - restoring the power settings.");
+}
+
+// ---------------------------------------------------------------------
+// Prompts: where there's a terminal attached we talk there, because that's
+// what someone running `sleepless --set-password` from a shell expects.
+// Without one (started from the tray or the desktop) we use an askpass
+// dialog. Shelling out to zenity / kdialog / stty keeps the binary free of
+// GUI library dependencies, same as everywhere else in this backend.
+// ---------------------------------------------------------------------
+
+use crate::lock::{self, Secret};
+use std::io::{self, Write};
+use std::process::Command;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Prompt {
+    Zenity,
+    Kdialog,
+    Terminal,
+}
+
+fn has_desktop_session() -> bool {
+    env::var_os("DISPLAY").is_some() || env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
+/// Where the *lock screen* should ask: a dialog, since the display has just
+/// come back and nobody is necessarily in a terminal.
+fn prompt_for_gate() -> Prompt {
+    if has_desktop_session() && has_command("zenity") {
+        Prompt::Zenity
+    } else if has_desktop_session() && has_command("kdialog") {
+        Prompt::Kdialog
+    } else {
+        Prompt::Terminal
+    }
+}
+
+/// Where an interactive command (--set-password and friends) should ask.
+fn prompt_for_command() -> Prompt {
+    if unix::has_tty() {
+        Prompt::Terminal
+    } else {
+        prompt_for_gate()
+    }
+}
+
+/// Asks for a secret, echoing nothing. None if the user cancelled.
+/// Used by the lock screen.
+pub fn prompt_secret(title: &str, message: &str) -> Option<Secret> {
+    ask_secret(prompt_for_gate(), title, message)
+}
+
+/// Same, but in the terminal when there is one. Used by the enrolment
+/// commands.
+pub fn prompt_secret_interactive(title: &str, message: &str) -> Option<Secret> {
+    ask_secret(prompt_for_command(), title, message)
+}
+
+fn ask_secret(where_: Prompt, title: &str, message: &str) -> Option<Secret> {
+    match where_ {
+        Prompt::Zenity => run_output(
+            "zenity",
+            &[
+                "--password",
+                &format!("--title={title}"),
+                &format!("--text={message}"),
+            ],
+        )
+        .map(|out| Secret::new(out.trim_end_matches(['\n', '\r']))),
+        Prompt::Kdialog => run_output("kdialog", &["--title", title, "--password", message])
+            .map(|out| Secret::new(out.trim_end_matches(['\n', '\r']))),
+        Prompt::Terminal => ask_in_terminal(message),
+    }
+}
+
+fn ask_in_terminal(message: &str) -> Option<Secret> {
+    if !unix::has_tty() {
+        eprintln!("Sleepless: no terminal to ask for a password in.");
+        return None;
+    }
+    // Turn the terminal's echo off through stty, so the password doesn't
+    // appear on screen, then put it back however it was.
+    let echo_off = Command::new("stty")
+        .args(["-echo"])
+        .status()
+        .is_ok_and(|s| s.success());
+    eprint!("{message} ");
+    let _ = io::stderr().flush();
+    let mut line = String::new();
+    let read = std::io::stdin().read_line(&mut line);
+    if echo_off {
+        let _ = Command::new("stty").args(["echo"]).status();
+    }
+    eprintln!();
+    match read {
+        Ok(n) if n > 0 => Some(Secret::new(line.trim_end_matches(['\n', '\r']))),
+        _ => None,
+    }
+}
+
+/// One-line result message for the credential commands.
+pub fn report(message: &str) {
+    if unix::has_tty() {
+        for line in message.lines() {
+            println!("Sleepless: {line}");
+        }
+    } else {
+        notify("Sleepless", message);
+    }
+}
+
+pub fn notify(title: &str, message: &str) {
+    match prompt_for_command() {
+        Prompt::Zenity => {
+            let _ = run_output(
+                "zenity",
+                &[
+                    "--info",
+                    &format!("--title={title}"),
+                    &format!("--text={message}"),
+                ],
+            );
+        }
+        Prompt::Kdialog => {
+            let _ = run_output("kdialog", &["--title", title, "--passive-popup", message]);
+        }
+        Prompt::Terminal => {
+            for line in message.lines() {
+                println!("Sleepless: {line}");
+            }
+        }
+    }
+}
+
+pub fn ask_yes_no(title: &str, message: &str) -> bool {
+    match prompt_for_command() {
+        Prompt::Zenity => run_output(
+            "zenity",
+            &[
+                "--question",
+                &format!("--title={title}"),
+                &format!("--text={message}"),
+            ],
+        )
+        .is_some(),
+        Prompt::Kdialog => run_output("kdialog", &["--title", title, "--yesno", message]).is_some(),
+        Prompt::Terminal => {
+            if !unix::has_tty() {
+                return false;
+            }
+            eprint!("{message} [y/N] ");
+            let _ = io::stderr().flush();
+            let mut answer = String::new();
+            let _ = std::io::stdin().read_line(&mut answer);
+            matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+        }
+    }
+}
+
+/// No passkey on Linux: there's no portable biometric prompt that isn't the
+/// desktop's own lock screen, so the password is the whole credential.
+pub fn passkey_supported() -> Option<&'static str> {
+    None
+}
+
+pub fn passkey_enroll() -> Result<&'static str, String> {
+    Err("Sleepless has no passkey support on Linux, so use the password".to_string())
 }

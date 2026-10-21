@@ -7,11 +7,15 @@
 //   Keep awake with lid closed   ...this is ticked (remembered between runs)
 //                             also on a global shortcut, see hotkey.rs
 //   Launch at login           adds / removes an autostart entry
+//   Set a password to come back…   runs `sleepless --set-password`
+//   Remove the password       runs `sleepless --clear-password`, greyed out
+//                             while nothing is enrolled
 //   Quit
 //
 // All the actual work stays in the CLI, which is looked up next to this
 // executable first and then on PATH. Each session is a separate
-// `sleepless` process that exits by itself once you come back.
+// `sleepless` process that exits by itself once you come back - and, when a
+// password is enrolled, only once that password is typed.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
@@ -40,6 +44,8 @@ struct App {
     start: MenuItem,
     lid: CheckMenuItem,
     login: CheckMenuItem,
+    set_password: MenuItem,
+    clear_password: MenuItem,
     quit: MenuItem,
     settings: Settings,
     _hotkey: Option<global_hotkey::GlobalHotKeyManager>,
@@ -165,6 +171,36 @@ pub fn start_session() -> io::Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------
+// The unlock credential: the CLI owns it, the tray only starts its prompts
+// ---------------------------------------------------------------------
+
+/// Runs `sleepless <arg>` and waits for it. The CLI does all the asking (a
+/// dialog on Windows and macOS, the terminal or an askpass tool on Linux), so
+/// the credential lives in exactly one place.
+fn run_cli(arg: &str) -> bool {
+    let path = sleepless_path();
+    match Command::new(&path).arg(arg).status() {
+        Ok(status) => status.success(),
+        Err(e) => {
+            eprintln!("Sleepless: could not run {}: {e}", path.display());
+            false
+        }
+    }
+}
+
+/// True when coming back from the black screen needs a password. The CLI
+/// prints nothing; only its exit code matters here.
+fn password_is_set() -> bool {
+    match Command::new(sleepless_path())
+        .arg("--has-password")
+        .status()
+    {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    }
+}
+
 impl App {
     fn turn_display_off(&mut self) {
         if let Err(e) = start_session() {
@@ -174,6 +210,22 @@ impl App {
                 let _ = tray.set_tooltip(Some(msg));
             }
         }
+    }
+
+    /// Reflects what the CLI actually has stored, rather than remembering a
+    /// tick ourselves.
+    fn refresh_password_items(&self) {
+        self.clear_password.set_enabled(password_is_set());
+    }
+
+    fn enrol_password(&mut self) {
+        run_cli("--set-password");
+        self.refresh_password_items();
+    }
+
+    fn drop_password(&mut self) {
+        run_cli("--clear-password");
+        self.refresh_password_items();
     }
 
     fn toggle_lid(&mut self) {
@@ -217,6 +269,10 @@ fn handle(event: MenuEvent) {
             app.toggle_lid();
         } else if id == app.login.id() {
             app.toggle_login();
+        } else if id == app.set_password.id() {
+            app.enrol_password();
+        } else if id == app.clear_password.id() {
+            app.drop_password();
         } else if id == app.quit.id() {
             // Remove the icon now rather than leaving a ghost in the
             // Windows tray until the mouse passes over it.
@@ -272,12 +328,19 @@ fn build_app() -> tray_icon::Result<App> {
         None,
     );
     let login = CheckMenuItem::new("Launch at login", true, login_enabled, None);
+    // The CLI does the prompting; the tray just starts it and shows what it
+    // ended up with.
+    let set_password = MenuItem::new("Set a password to come back…", true, None);
+    let clear_password = MenuItem::new("Remove the password", password_is_set(), None);
     let quit = MenuItem::new("Quit Sleepless", true, None);
     let menu = Menu::with_items(&[
         &start,
         &PredefinedMenuItem::separator(),
         &lid,
         &login,
+        &PredefinedMenuItem::separator(),
+        &set_password,
+        &clear_password,
         &PredefinedMenuItem::separator(),
         &quit,
     ])
@@ -304,6 +367,8 @@ fn build_app() -> tray_icon::Result<App> {
         start,
         lid,
         login,
+        set_password,
+        clear_password,
         quit,
         settings,
         _hotkey: hotkey,

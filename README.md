@@ -4,6 +4,8 @@
 
 A tiny utility for **Windows, macOS and Linux** that turns your screen off while preventing sleep, then puts everything back the moment you return.  
 
+Optionally, coming back asks for a password (plus Touch ID on macOS) - checked by Sleepless itself, never through the OS lock screen, so your VPN and the rest of the session stay up. See [Coming back: a password](#coming-back-a-password-and-touch-id-on-top).
+
 ## Why not use native Windows features?
 Windows 11 ties the Screen Off feature together with Sleep, so you cannot configure one without the other. Another caveat is that when the screen turns off, Windows immediately locks your computer regardless of any settings I tried. This means that tools like PowerToys Awake do not work either while the screen is off, so the computer goes to sleep using the configured OS sleep time. Very odd.
 
@@ -36,6 +38,7 @@ Grab the latest build from the [Releases](../../releases) page:
 - **Turn display off**: runs `sleepless` (with `--asroot` if the next item is ticked). Also on a global keyboard shortcut: **Ctrl+Cmd+S** on macOS, **Ctrl+Win+S** on Windows, **Ctrl+Super+S** on Linux. It waits until you let go of the keys, so releasing them doesn't wake the screen right back up.
 - **Keep awake with the lid closed (--asroot)**: remembered between runs.
 - **Launch at login**: starts the tray icon when you log in. It uses each system's own per-user mechanism, so you can also see / remove it there: the `Sleepless` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (Task Manager > Startup apps), `~/Library/LaunchAgents/io.github.ilyatbn.sleepless-gui.plist` (System Settings > General > Login Items) or `~/.config/autostart/sleepless-gui.desktop`.
+- **Set a password to come back…** / **Remove the password**: the tray starts the CLI's own prompts (`sleepless --set-password`, `--clear-password`) and waits for them; "Remove the password" is greyed out while nothing is enrolled. The credential belongs to the CLI, so the menu can't drift out of sync with it, and `sleepless` started by hand obeys the same setting.
 - **Quit Sleepless**: removes the icon. A screen-off session that's already running carries on until you come back.
 
 It's only a launcher: it looks for the `sleepless` command-line tool next to itself (then on `PATH`), so keep the two together. On macOS, Sleepless GUI.app already contains it; install it the same way as Sleepless.app below, including the `xattr` step. Only one tray icon runs per user; starting it again does nothing.
@@ -78,8 +81,53 @@ cd sleepless-linux-x86_64
 sleepless                  # silent, display goes off, back when you move the mouse
 sleepless --debug          # log everything (Windows: to the cmd window, also /debug; macOS/Linux: stderr)
 sleepless --asroot         # also allow closing the lid without anything disconnecting or sleeping
+sleepless --set-password   # coming back needs a password (see below)
 sleepless --help
 ```
+
+### Coming back: a password, and Touch ID on top
+
+By default the black screen goes away as soon as you touch the mouse. If you'd rather
+have to prove who you are first:
+
+```
+sleepless --set-password    # asked twice, then stored
+sleepless --clear-password  # back to no password
+sleepless --set-passkey     # also allow Touch ID (macOS); needs a password first
+sleepless --clear-passkey
+sleepless --has-password    # exit 0 if something is enrolled, 1 if not (what the tray app asks)
+```
+
+Nothing here uses the OS lock screen, because that takes your VPN, your SSH sessions and
+the rest of the session down with it. Sleepless draws its own black screen and checks the
+answer itself:
+
+| Platform | What coming back looks like | Passkey |
+| --- | --- | --- |
+| Windows | A black window over every monitor goes up *before* the screensaver starts, so the keypress that ends the screensaver reveals that window instead of your desktop. Type the password, Enter. | not yet |
+| macOS | The black windows stay up and a password box is raised above them. | Touch ID is tried first, then the box |
+| Linux | The display comes back first (the compositor decides when DPMS does), then an askpass dialog - or the terminal, if Sleepless was started from one. | none |
+
+The password is stored as a PBKDF2-HMAC-SHA256 hash with a random salt (600 000 rounds),
+never in the clear: `HKCU\Software\Sleepless\password` on Windows,
+`~/Library/Application Support/Sleepless/sleepless.conf` on macOS and
+`~/.config/sleepless/sleepless.conf` on Linux (written `0600`). Wrong answers cost
+progressively more time, and dismissing the prompt doesn't let you in.
+
+**What it is and isn't.** It keeps whoever wanders up to your machine off a screen that
+Sleepless deliberately left unlocked - it is not a security boundary. It doesn't try to
+hide from someone with admin rights, and **killing the Sleepless process is a supported
+way out**: on Windows the power settings it changed are restored by a registry restore
+point the next time Sleepless starts, and on macOS/Linux the helpers that hold the
+no-sleep state go away with the process. When you want the real thing, lock the session
+yourself (`Win+L` / `Ctrl+Cmd+Q`); Sleepless never triggers that for you.
+
+On macOS the passkey is Touch ID through `LocalAuthentication`, which does the verifying -
+Sleepless stores nothing from it beyond a marker. It's strictly an addition: a password has
+to be enrolled first, and if the sensor isn't available, the prompt is cancelled, or the
+system won't talk to us, you get the password box. Windows Hello would mean the WebAuthn
+C API (attestation and assertion blobs, CBOR and COSE parsing, an ECDSA signature check),
+which isn't in this build; the password carries the lock screen there on its own.
 
 ### `--asroot`: closing the lid
 Normally closing a laptop lid suspends it, which drops Wi-Fi, SSH sessions, downloads, etc. With `--asroot` the machine keeps running with the lid shut until you come back:
@@ -138,11 +186,23 @@ GitHub Actions (`.github/workflows/release.yml`) builds Windows, macOS (universa
   `AllocConsole` if launched without a console, e.g. double-clicked), then logs manually via
   `WriteConsoleW` rather than `println!`, since a GUI-subsystem process has no valid stdout handle
   until a console is attached.
+- **Password gate**: a `WS_POPUP` window, topmost and spanning the virtual desktop, is created
+  before `SC_SCREENSAVE` is broadcast, with the password box and Unlock button hidden. When the
+  saver ends, that window is what's revealed. `IsDialogMessageW` in its message loop turns Enter
+  into a press of the default button; Escape and Alt+F4 are ignored while locked, and a 200 ms
+  `WM_TIMER` re-asserts topmost, foreground and focus. The prompt itself is a `WS_POPUP` with an
+  `EDIT` (`ES_PASSWORD`) - not a dialog resource, so no template to ship.
+- **Restore point**: what the run is about to change is written to
+  `HKCU\Software\Sleepless\restore` before `PowerWrite*ValueIndex` touches it and deleted once
+  the values are back; a run that starts with that key present puts them back first. So the
+  process can be killed without the timeouts getting stuck on "Never".
 
 ### macOS
 - **Stay awake**: `caffeinate -d -i -m -s -w <pid>`: power assertions against display and system sleep that end by itself when Sleepless exits. The monitors are never turned off, because on macOS that's what brings up the lock screen.
 - **Black screen**: a borderless black `NSWindow` on every display at screensaver window level (above the menu bar, Dock and full-screen apps), with the cursor hidden. Not the system screensaver: on recent macOS that shows the lock-screen clock and wallpaper, and often asks for the password afterwards.
 - **Waiting**: polls CoreGraphics' `CGEventSourceSecondsSinceLastEventType` (HID idle time) and exits as soon as it drops, i.e. on any keyboard/mouse input, which also removes the windows.
+- **Password gate**: AppKit needs the main thread, so the input-watching thread only sets a flag; the main thread pumps the event queue itself, and asks there. The prompt is an `NSAlert` with an `NSSecureTextField` accessory view - the alert's buttons run the modal loop, which is what makes Return submit and Escape harmless - raised to screensaver window level + 1 so the black windows never uncover. With nothing enrolled the ordinary `NSApplication.run()` path is used.
+- **Touch ID**: `LAContext.canEvaluatePolicy` / `evaluatePolicy` through the Objective-C runtime (Linking `LocalAuthentication.framework` so the class is actually loaded). Its reply block is called back on the main queue, which is the thread that asked, so the run loop is pumped until it fires; a timeout falls through to the password box.
 
 ### Linux
 - **Stay awake**: `systemd-inhibit --mode=block --what=sleep:idle` (plus `handle-lid-switch` with `--asroot`) wrapped around a tiny shell loop that exits when Sleepless does. `elogind-inhibit` works too.
@@ -151,13 +211,18 @@ GitHub Actions (`.github/workflows/release.yml`) builds Windows, macOS (universa
   - **KDE Plasma** (Wayland or X11): `kscreen-doctor --dpms off/on`; user activity via `org.freedesktop.ScreenSaver.GetSessionIdleTime`.
   - **Other X11** sessions: `xset dpms force off`, then waits for the X server to report the monitor back on.
   - Anything else (e.g. wlroots compositors like Sway): the display is left alone, but the machine is kept awake until you press Enter / Ctrl+C.
+- **Password gate**: the power settings are restored only after the password is right. The prompt is `zenity --password` / `kdialog --password` when there's a desktop session, or the terminal with the echo switched off through `stty` when Sleepless was started from one. Unlike the other platforms the desktop is visible while it asks: the compositor decides when DPMS comes back on input, and there's no portable way for an ordinary process to sit above it.
 
 ## Caveats / things worth knowing
-- **Windows: no crash/kill-switch recovery**: if the process is killed (Task Manager, `taskkill /F`, log
-  off) while the screensaver is up, the original timeouts won't be restored automatically. A
-  `Ctrl+C`/console-handler or a "restore last saved values" flag would be a reasonable follow-up
-  if that matters to you. (macOS and Linux don't have this problem: everything they change is
-  held by helper processes that clean up when Sleepless exits.)
+- **Windows: restore point**: the timeouts Sleepless changes are saved to `HKCU\Software\Sleepless\restore`
+  and put back when the run ends - including a run that was killed, which restores them at the start of
+  the next one. So nothing is stuck on "Never", but a killed session does leave the settings alone until
+  Sleepless runs again.
+- **The come-back password is a deterrent**: it stops whoever is in front of the machine from walking
+  into an unlocked session that Sleepless blacked out for you. It doesn't resist anyone with admin
+  rights, and `sleepless` can always be killed to get past it - that's deliberate, because the OS lock
+  screen (`Win+L` / `Ctrl+Cmd+Q`) is the thing that actually protects the session, and it also protects
+  your VPN and everything else the way it's meant to.
 - **Lock screen**: if your OS is set to require a password after the display turns off / the
   screensaver starts, you'll still get the lock screen when you come back. That's by design;
   Sleepless doesn't touch security settings. (macOS avoids both: the display stays on and the

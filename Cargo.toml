@@ -23,25 +23,45 @@ lto = true
 strip = true
 panic = "abort"
 
-# The black full-screen windows on macOS.
+# Salted password hashing for the "come back" prompt (src/lock.rs) plus the OS
+# random number generator for its salt. Both are pure Rust and build for every
+# platform we ship.
+[dependencies]
+pbkdf2 = { version = "0.13", features = ["sha2"] }
+getrandom = "0.4"
+
+# The black full-screen windows and the password prompts on macOS.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
+# LocalAuthentication hands its result back in an Objective-C block.
+block2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
+    "NSAlert",
     "NSApplication",
+    "NSButton",
     "NSColor",
+    "NSControl",
     "NSCursor",
+    "NSEvent",
     "NSGraphics",
     "NSResponder",
     "NSRunningApplication",
     "NSScreen",
+    "NSSecureTextField",
+    "NSTextField",
+    "NSView",
     "NSWindow",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSArray",
+    "NSDate",
     "NSEnumerator",
+    "NSError",
     "NSGeometry",
+    "NSRunLoop",
+    "NSString",
 ] }
 
 [target.'cfg(windows)'.dependencies]
@@ -50,8 +70,11 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 # signatures with no wrapper-type guessing.
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
     "Win32_System_Console",
     "Win32_System_Power",
     "Win32_System_Registry",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
