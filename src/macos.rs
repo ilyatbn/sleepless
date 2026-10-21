@@ -1749,11 +1749,18 @@ mod tests {
         assert_eq!(cursor_action(true, false), (false, true)); // show again
         assert_eq!(cursor_action(false, false), (false, false)); // already shown
 
-        // Repeated requests in one direction stay balanced.
+        // Repeated requests in one direction stay balanced: an action always
+        // flips the state and a no-op never does, which is what keeps AppKit's
+        // own count straight.
         let mut hidden = false;
         let (mut hides, mut shows) = (0, 0);
         for want_hide in [true, true, false, false, true, false, true, true, false] {
             let (next, act) = cursor_action(hidden, want_hide);
+            assert_eq!(
+                next != hidden,
+                act,
+                "from hidden={hidden}, asking to hide={want_hide}"
+            );
             hidden = next;
             if act {
                 if want_hide {
@@ -1763,7 +1770,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!((hides, shows), (4, 3));
-        assert!(hidden, "nine requests, ending hidden by one");
+        // Nine requests, and only three of each kind did anything - so a session
+        // that hides the pointer once and shows it once is never left with the
+        // pointer stuck either way.
+        assert_eq!((hides, shows), (3, 3));
+        assert!(!hidden, "ending where it started: visible");
     }
 }
