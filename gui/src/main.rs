@@ -21,6 +21,7 @@
 
 mod autostart;
 mod hotkey;
+mod log;
 
 use std::cell::RefCell;
 use std::env;
@@ -146,22 +147,31 @@ pub fn is_running() -> bool {
 /// Called from the menu (main thread) and the shortcut (any thread).
 pub fn start_session() -> io::Result<()> {
     if RUNNING.swap(true, Ordering::SeqCst) {
+        log::note("turn display off: a session is already running, ignoring");
         return Ok(());
     }
     let path = sleepless_path();
-    let mut cmd = Command::new(&path);
+    let mut args: Vec<String> = Vec::new();
     if ASROOT.load(Ordering::SeqCst) {
-        cmd.arg("--asroot");
+        args.push("--asroot".to_string());
     }
+    log::note(&format!(
+        "turn display off: running {:?} {args:?}",
+        path.canonicalize().unwrap_or(path.clone())
+    ));
+    let mut cmd = Command::new(&path);
+    cmd.args(&args);
     match cmd.spawn() {
         Ok(mut child) => {
             thread::spawn(move || {
-                let _ = child.wait();
+                let status = child.wait();
+                log::note(&format!("session process finished: {status:?}"));
                 RUNNING.store(false, Ordering::SeqCst);
             });
             Ok(())
         }
         Err(e) => {
+            log::note(&format!("could not start {}: {e}", path.display()));
             RUNNING.store(false, Ordering::SeqCst);
             Err(io::Error::new(
                 e.kind(),
@@ -178,11 +188,29 @@ pub fn start_session() -> io::Result<()> {
 /// Runs `sleepless <arg>` and waits for it. The CLI does all the asking (a
 /// dialog on Windows and macOS, the terminal or an askpass tool on Linux), so
 /// the credential lives in exactly one place.
+///
+/// The child's output is captured and copied into the log: a menu-bar app has
+/// no console, so without this a failed enrolment leaves nothing behind. The
+/// CLI writes its own detail to the same file.
 fn run_cli(arg: &str) -> bool {
     let path = sleepless_path();
-    match Command::new(&path).arg(arg).status() {
-        Ok(status) => status.success(),
+    log::note(&format!(
+        "credential command: running {:?} {arg}",
+        path.canonicalize().unwrap_or_else(|_| path.clone())
+    ));
+    match Command::new(&path).arg(arg).output() {
+        Ok(out) => {
+            for stream in [&out.stdout, &out.stderr] {
+                let text = String::from_utf8_lossy(stream).trim().to_string();
+                for line in text.lines().filter(|l| !l.is_empty()) {
+                    log::note(&format!("  {arg} said: {line}"));
+                }
+            }
+            log::note(&format!("credential command {arg}: exit {:?}", out.status));
+            out.status.success()
+        }
         Err(e) => {
+            log::note(&format!("could not run {}: {e}", path.display()));
             eprintln!("Sleepless: could not run {}: {e}", path.display());
             false
         }
@@ -192,12 +220,24 @@ fn run_cli(arg: &str) -> bool {
 /// True when coming back from the black screen needs a password. The CLI
 /// prints nothing; only its exit code matters here.
 fn password_is_set() -> bool {
-    match Command::new(sleepless_path())
-        .arg("--has-password")
-        .status()
-    {
-        Ok(status) => status.success(),
-        Err(_) => false,
+    let path = sleepless_path();
+    match Command::new(&path).arg("--has-password").output() {
+        Ok(out) => {
+            let set = out.status.success();
+            log::note(&format!(
+                "--has-password: exit {:?} -> {}",
+                out.status,
+                if set { "enrolled" } else { "nothing enrolled" }
+            ));
+            set
+        }
+        Err(e) => {
+            log::note(&format!(
+                "--has-password: could not run {}: {e}",
+                path.display()
+            ));
+            false
+        }
     }
 }
 
@@ -219,12 +259,22 @@ impl App {
     }
 
     fn enrol_password(&mut self) {
-        run_cli("--set-password");
+        log::note("menu: set a password to come back");
+        let ok = run_cli("--set-password");
+        log::note(&format!(
+            "password enrolment process {}",
+            if ok { "succeeded" } else { "did not succeed" }
+        ));
         self.refresh_password_items();
     }
 
     fn drop_password(&mut self) {
-        run_cli("--clear-password");
+        log::note("menu: remove the password");
+        let ok = run_cli("--clear-password");
+        log::note(&format!(
+            "password removal process {}",
+            if ok { "succeeded" } else { "did not succeed" }
+        ));
         self.refresh_password_items();
     }
 
@@ -233,6 +283,7 @@ impl App {
         ASROOT.store(self.settings.asroot, Ordering::SeqCst);
         self.settings.save();
         self.lid.set_checked(self.settings.asroot);
+        log::note(&format!("lid-closed mode is now {}", self.settings.asroot));
     }
 
     fn toggle_login(&mut self) {
@@ -253,6 +304,7 @@ fn on_tray_click(event: TrayIconEvent) {
         ..
     } = event
     {
+        log::note("tray icon clicked: turn display off");
         if let Err(e) = start_session() {
             eprintln!("Sleepless: {e}");
         }
@@ -274,6 +326,7 @@ fn handle(event: MenuEvent) {
         } else if id == app.clear_password.id() {
             app.drop_password();
         } else if id == app.quit.id() {
+            log::note("menu: quit");
             // Remove the icon now rather than leaving a ghost in the
             // Windows tray until the mouse passes over it.
             drop(app.tray.take());
@@ -435,10 +488,19 @@ fn run_event_loop() {
 
 fn main() {
     if already_running() {
+        log::note("another tray icon is already running for this user; exiting");
         return;
     }
+    log::note(&format!(
+        "sleepless-gui {} starting (pid {}), executable {:?}, log {:?}",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        env::current_exe().ok(),
+        log::path()
+    ));
     init_platform();
     let app = build_app().unwrap_or_else(|e| {
+        log::note(&format!("could not create the tray icon: {e}"));
         eprintln!("Sleepless: could not create the tray icon: {e}");
         if cfg!(target_os = "linux") {
             eprintln!(

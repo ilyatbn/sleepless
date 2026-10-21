@@ -13,7 +13,11 @@
   - `src/lock.rs` - the come-back credential: PBKDF2-HMAC-SHA256, verify, back-off, and
     `unlock_loop` (the ask-until-it-matches loop all three lock screens share).
   - `src/enroll.rs` - what `--set-password` / `--set-passkey` and friends do.
-  - `gui/` - the tray / menu bar app (separate crate, `sleepless-gui`).
+  - `src/logging.rs` - the single log file both binaries append to (`%LOCALAPPDATA%\Sleepless`,
+    `~/Library/Logs/Sleepless`, `~/.local/state/sleepless`; `SLEEPLESS_LOG` overrides). The
+    `log!` macro always writes there and additionally to the console under `--debug`.
+  - `gui/` - the tray / menu bar app (separate crate, `sleepless-gui`); its own small
+    logger in `gui/src/log.rs` writes to the same file so one report shows both halves.
 - Dependencies:
   - all platforms: `pbkdf2 = { version = "0.13", features = ["sha2"] }`, `getrandom = "0.4"`
   - Windows only: `windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_Console", "Win32_System_Power", "Win32_System_Registry", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }`
@@ -49,6 +53,19 @@ Driving a prompt-driven CLI command without a GUI:
   which looks like the echo suppression is broken when it isn't.
 
 ## Password gate gotchas
+- **`NSAlert.runModal` answers with `NSAlertFirstButtonReturn` (1000) /
+  NSAlertSecondButtonReturn (1001)**, numbered by the order the buttons were added - *not*
+  `NSModalResponseOK` (1), which belongs to hand-rolled modal windows. Comparing against
+  `NSModalResponseOK` made every macOS dialog look cancelled, which is why starting a
+  password from the menu bar reported "cancelled: no password was set" (and would have
+  locked the macOS lock screen permanently, since its prompt can't be cancelled). The
+  comparison lives in one `accepted()` function with a test on it.
+- A test-build for a macOS target links against the macOS SDK, which this machine hasn't
+  got: `cargo check --target aarch64-apple-darwin` works (no linking), `cargo test
+  --target aarch64-apple-darwin` does not. The macOS-only tests are compiled by that
+  command's front end but can only be *run* on a Mac.
+- The Linux job runs `cargo test --workspace` on the host arch; the aarch64 leg only
+  cross-compiles, so tests aren't run there.
 - `windows-sys`: `HWND` is `*mut c_void` (test with `is_null()`), `BeginPaint`/`EndPaint`/
   `PAINTSTRUCT`/`InvalidateRect` live in `Win32::Graphics::Gdi`, and `ES_*`/`BS_*`/
   `TRANSPARENT` are `i32` where the `WS_*` styles are `u32`.

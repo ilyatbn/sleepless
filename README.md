@@ -122,6 +122,26 @@ point the next time Sleepless starts, and on macOS/Linux the helpers that hold t
 no-sleep state go away with the process. When you want the real thing, lock the session
 yourself (`Win+L` / `Ctrl+Cmd+Q`); Sleepless never triggers that for you.
 
+### If something doesn't work: the log file
+
+Both Sleepless programs append to one plain-text log, started whether or not `--debug`
+was used (a session launched from the menu bar has no console to print to):
+
+| Platform | File |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\Sleepless\sleepless.log` |
+| macOS | `~/Library/Logs/Sleepless/sleepless.log` |
+| Linux | `~/.local/state/sleepless/sleepless.log` (`$XDG_STATE_HOME`) |
+
+It records each run (pid, arguments), what the tray app asked the CLI to do and the CLI's
+exit code, which prompt was shown, which button you pressed, whether a passkey was
+offered, and what happened when the screen was unlocked. Passwords themselves are never
+logged - only how long they were. The file is capped at 512 KiB and starts over;
+`SLEEPLESS_LOG=/some/path` sends it somewhere else.
+
+To capture a problem: reproduce it, then send the whole file. For a menu-bar session, the
+lines tagged `sleepless-gui` are the tray app and the rest come from the CLI it started.
+
 On macOS the passkey is Touch ID through `LocalAuthentication`, which does the verifying -
 Sleepless stores nothing from it beyond a marker. It's strictly an addition: a password has
 to be enrolled first, and if the sensor isn't available, the prompt is cancelled, or the

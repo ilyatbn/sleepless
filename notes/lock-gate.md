@@ -178,6 +178,47 @@ Tray app: menu items for the same, with the enabled/checked state read through
 - macOS Touch ID from an ad-hoc signed bundle may be refused by LocalAuthentication;
   handled as "passkey unavailable".
 
+## Beta 1 field report: "cancelled: no password was set" from the macOS menu bar
+
+Cause, confirmed from the bindings rather than guessed: `-[NSAlert runModal]` returns the
+button constant **`NSAlertFirstButtonReturn` (1000)**, `NSAlertSecondButtonReturn` (1001),
+assigned in the order buttons are added. `NSModalResponseOK` is **1** and belongs to
+hand-rolled modal windows. All three macOS prompt sites compared against
+`NSModalResponseOK`, so *every* macOS prompt - enrolment, the "replace it?" confirmation,
+the Touch ID offer, and the lock screen itself - was treated as cancelled.
+
+That last one is the more serious consequence: `prompt_secret_locked` returning `None`
+would have made `unlock_loop` re-ask forever, i.e. coming back from a black screen on
+macOS would have been impossible except by killing the process. Enrolment failing first is
+the only reason it was noticed.
+
+Fix: one `accepted(NSModalResponse) -> bool` comparing with `NSAlertFirstButtonReturn`,
+plus a macOS test asserting 1000/1001 and that `NSModalResponseOK`/`Cancel`/`Abort` are
+all rejected (`cargo test --target aarch64-apple-darwin --no-run` compiles it; only a Mac
+can run it - linking a macOS test binary here needs an SDK this machine hasn't got).
+
+Diagnosis help added with it, since "it said cancelled" from a menu-bar app is otherwise
+undiagnosable:
+
+- `src/logging.rs` + `gui/src/log.rs`: one shared log file, written whether or not
+  `--debug` was passed. Windows `%LOCALAPPDATA%\Sleepless\sleepless.log`, macOS
+  `~/Library/Logs/Sleepless/sleepless.log`, Linux `~/.local/state/sleepless/sleepless.log`;
+  `SLEEPLESS_LOG` overrides. Capped at 512 KiB, then starts over with a marker line.
+- The `log!` macro now always writes to the file (and to the console with `--debug`).
+- The tray app logs which CLI it resolved, the arguments, the child's captured stdout and
+  stderr and its exit status; the CLI logs every enrolment step, the numeric response each
+  dialog returned, passkey availability, and the exit code it finished with. Passwords are
+  never logged, only their lengths.
+- Two bugs the new tests caught immediately: `OpenOptions` needed `write(true)` for the
+  truncating case (append alone isn't enough), and the file-touching tests had to be
+  serialised over the static sink + `SLEEPLESS_LOG` (same class of mistake as the earlier
+  config-dir race).
+- The date formatting (`civil_from_days`, no crate for it) was cross-checked against
+  Python's date arithmetic over 14 286 sampled days including pre-1970 negatives; my
+  *hand-written test expectations* were wrong twice (2000-02-29 is day 11016, not 11017),
+  the algorithm wasn't.
+- CI: the Linux x86_64 leg now runs `cargo test --workspace` before building.
+
 ## Release
 
 Pushed as branch `lock-gate` from `claude/macos-linux-support-lhfrj9`, squashed to one

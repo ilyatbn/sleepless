@@ -33,8 +33,14 @@ static DEBUG: AtomicBool = AtomicBool::new(false);
 
 macro_rules! log {
     ($($arg:tt)*) => {{
+        // Always into the log file (src/logging.rs), and into the console when
+        // --debug was passed: a session started from the tray / menu bar has no
+        // console at all, so a file is the only way a report can be more useful
+        // than a repro request.
+        let message = format!($($arg)*);
+        $crate::logging::note(&message);
         if $crate::DEBUG.load(std::sync::atomic::Ordering::Relaxed) {
-            $crate::platform::debug_log(&format!($($arg)*));
+            $crate::platform::debug_log(&message);
         }
     }};
 }
@@ -56,6 +62,7 @@ mod unix;
 
 mod enroll;
 mod lock;
+mod logging;
 mod store;
 
 /// What we were asked to do. Everything except `Run` is about the unlock
@@ -132,12 +139,15 @@ fn parse_args() -> Options {
 }
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
     let opts = parse_args();
     platform::init_logging(opts.debug);
     DEBUG.store(opts.debug, Ordering::Relaxed);
     log!(
-        "Sleepless starting (pid {}), options: {opts:?}",
-        std::process::id()
+        "Sleepless {} starting (pid {}), args {args:?}, options: {opts:?}; logging to {:?}",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        logging::path()
     );
     let code = match opts.command {
         Command::Run => {
@@ -145,7 +155,12 @@ fn main() {
             log!("Done. Exiting.");
             0
         }
-        command => enroll::run(command),
+        command => {
+            let code = enroll::run(command);
+            log!("Credential command {command:?} finished with exit code {code}");
+            code
+        }
     };
+    log!("Sleepless exiting with code {code}");
     std::process::exit(code);
 }

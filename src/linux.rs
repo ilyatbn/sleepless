@@ -405,6 +405,7 @@ fn ask_in_terminal(message: &str) -> Option<Secret> {
 
 /// One-line result message for the credential commands.
 pub fn report(message: &str) {
+    log!("Report to the user: {}", message.replace('\n', " "));
     if unix::has_tty() {
         for line in message.lines() {
             println!("Sleepless: {line}");

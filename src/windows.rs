@@ -470,6 +470,7 @@ pub fn prompt_secret(title: &str, message: &str) -> Option<Secret> {
 
 /// One-line result message for the credential commands.
 pub fn report(message: &str) {
+    log!("Report to the user: {}", message.replace('\n', " "));
     notify("Sleepless", message);
 }
 

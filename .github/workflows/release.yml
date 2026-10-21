@@ -133,6 +133,13 @@ jobs:
         if: matrix.linker
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
 
+      # The credential store, PBKDF2, the back-off and the log file are all
+      # platform-independent, so their tests run on the Linux job (once, on the
+      # host arch - the aarch64 leg only cross-compiles).
+      - name: Unit tests
+        if: matrix.arch == 'x86_64'
+        run: cargo test --workspace
+
       - name: Build release binary
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}

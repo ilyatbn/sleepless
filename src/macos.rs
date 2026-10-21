@@ -29,9 +29,9 @@ use std::{env, fs, io, thread};
 use objc2::rc::Retained;
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSAlertStyle, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType,
-    NSColor, NSCursor, NSEventMask, NSModalResponseOK, NSScreen, NSSecureTextField, NSWindow,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSApplicationActivationPolicy,
+    NSBackingStoreType, NSColor, NSCursor, NSEventMask, NSModalResponse, NSScreen,
+    NSSecureTextField, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::NSDefaultRunLoopMode;
 
@@ -228,25 +228,56 @@ fn secret_alert(
     (alert, field)
 }
 
+/// An NSAlert numbers its buttons by the order they were added, starting at
+/// NSAlertFirstButtonReturn (1000) - *not* NSModalResponseOK (1), which is what
+/// a hand-rolled modal window uses. Comparing against NSModalResponseOK made
+/// every button look like a cancellation, which is exactly the "cancelled: no
+/// password was set" symptom.
+/// NSAlert's buttons answer with NSAlertFirstButtonReturn / Second / Third,
+/// numbered by the order they were added; NSModalResponseAbort means the alert
+/// was dismissed some other way (Escape, the close box).
+pub fn accepted(answer: NSModalResponse) -> bool {
+    answer == NSAlertFirstButtonReturn
+}
+
+/// Reads the field out of a finished secret alert, logging what the user
+/// actually pressed so a device report can tell "cancelled" from "wrong API".
+fn secret_from(field: &NSSecureTextField, answer: NSModalResponse, where_: &str) -> Option<Secret> {
+    log!(
+        "{where_}: alert response {answer} -> {}.",
+        if accepted(answer) {
+            "accepted"
+        } else {
+            "not accepted"
+        }
+    );
+    accepted(answer).then(|| Secret::new(field.stringValue().to_string().trim_end()))
+}
+
 /// Asks for a secret. None when the user cancelled.
 pub fn prompt_secret(title: &str, message: &str) -> Option<Secret> {
-    let mtm = MainThreadMarker::new()?;
+    let Some(mtm) = MainThreadMarker::new() else {
+        log!("prompt_secret: not on the main thread, cannot show a dialog.");
+        return None;
+    };
     let app = NSApplication::sharedApplication(mtm);
     let policy = app.activationPolicy();
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     #[allow(deprecated)] // activate() is macOS 14+; this still works there
     app.activateIgnoringOtherApps(true);
 
+    log!("Showing the password dialog: {title} / {message}");
     let (alert, field) = secret_alert(mtm, title, message, true);
     let answer = alert.runModal();
     app.setActivationPolicy(policy);
-    (answer == NSModalResponseOK).then(|| Secret::new(field.stringValue().to_string().trim_end()))
+    secret_from(&field, answer, "password dialog")
 }
 
 /// The lock screen's prompt: the same field, but on top of the black windows
 /// and with no Cancel button.
 fn prompt_secret_locked(title: &str, message: &str) -> Option<Secret> {
     let Some(mtm) = MainThreadMarker::new() else {
+        log!("prompt_secret_locked: not on the main thread.");
         return None;
     };
     let app = NSApplication::sharedApplication(mtm);
@@ -254,12 +285,14 @@ fn prompt_secret_locked(title: &str, message: &str) -> Option<Secret> {
     app.activateIgnoringOtherApps(true);
     let (alert, field) = secret_alert(mtm, title, message, false);
     raise_above_black_out(&alert.window());
+    log!("Showing the lock screen prompt: {message}");
     let answer = alert.runModal();
-    (answer == NSModalResponseOK).then(|| Secret::new(field.stringValue().to_string().trim_end()))
+    secret_from(&field, answer, "lock screen prompt")
 }
 
 /// One-line result message for the credential commands.
 pub fn report(message: &str) {
+    log!("Report to the user: {}", message.replace('\n', " "));
     notify("Sleepless", message);
 }
 
@@ -290,7 +323,12 @@ pub fn ask_yes_no(title: &str, message: &str) -> bool {
     // The first button is the default one, so it's what Return gives us.
     alert.addButtonWithTitle(&NSString::from_str("Yes"));
     alert.addButtonWithTitle(&NSString::from_str("No"));
-    alert.runModal() == NSModalResponseOK
+    let answer = alert.runModal();
+    log!(
+        "Confirmation dialog {title:?}: response {answer} -> {}.",
+        if accepted(answer) { "yes" } else { "no" }
+    );
+    accepted(answer)
 }
 
 /// Runs AppKit's event queue by hand until `stop` says so.
@@ -524,5 +562,30 @@ pub fn run(opts: crate::Options) {
         pump_events_until(mtm, || false);
     } else {
         NSApplication::sharedApplication(mtm).run();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use objc2_app_kit::{
+        NSAlertSecondButtonReturn, NSModalResponseAbort, NSModalResponseCancel, NSModalResponseOK,
+    };
+
+    /// The rule that broke password enrolment from the menu bar: an NSAlert
+    /// answers with NSAlertFirstButtonReturn (1000) and friends, never with
+    /// NSModalResponseOK (1). Comparing against OK made every dialog look
+    /// cancelled - and on the lock screen that would have meant nobody could
+    /// come back at all.
+    #[test]
+    fn only_the_first_alert_button_counts_as_accepted() {
+        assert_eq!(NSAlertFirstButtonReturn, 1000);
+        assert_eq!(NSAlertSecondButtonReturn, 1001);
+
+        assert!(accepted(NSAlertFirstButtonReturn));
+        assert!(!accepted(NSAlertSecondButtonReturn));
+        assert!(!accepted(NSModalResponseOK));
+        assert!(!accepted(NSModalResponseCancel));
+        assert!(!accepted(NSModalResponseAbort));
     }
 }
