@@ -714,15 +714,14 @@ fn lock_overlay_new() -> Option<HWND> {
         let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
         let mut info: MONITORINFO = std::mem::zeroed();
         info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        let monitor_width = if GetMonitorInfoW(monitor, &mut info) != 0 {
-            info.rcMonitor.right - info.rcMonitor.left
+        let on_screen = GetMonitorInfoW(monitor, &mut info) != 0;
+        let (centre, monitor_width) = if on_screen {
+            (
+                (info.rcMonitor.left + info.rcMonitor.right) / 2 - left,
+                info.rcMonitor.right - info.rcMonitor.left,
+            )
         } else {
-            width
-        };
-        let centre = if GetMonitorInfoW(monitor, &mut info) != 0 {
-            (info.rcMonitor.left + info.rcMonitor.right) / 2 - left
-        } else {
-            width / 2
+            (width / 2, width)
         };
 
         add_hidden_control(
