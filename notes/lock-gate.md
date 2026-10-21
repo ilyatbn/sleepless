@@ -526,6 +526,24 @@ use `LAPolicy::DeviceOwnerAuthenticationWithBiometrics`).
   Objective-C runtime, and the crash report is the only witness. That is why beta4's
   answer is "several independent layers plus a panic hook" rather than one root cause.
 
+### Published: v0.2.2beta4
+
+- Commit `ac535be` on `lock-gate`, tag `v0.2.2beta4` ->
+  https://github.com/ilyatbn/sleepless/releases/tag/v0.2.2beta4 (pre-release, not Latest).
+- CI run 14: version / linux x86_64 / linux aarch64 / windows / macos / release all
+  completed success. The macOS job is now the one that builds with
+  `--features sleepless/catch-objc-exceptions`, so the exception-catching path was compiled
+  by a real Objective-C toolchain there (locally it was only type-checked with stubbed
+  CC/AR).
+- Checked in the shipped artifacts rather than trusting the build:
+  - the universal `sleepless` reports `Sleepless 0.2.2-beta.4 starting (pid ...)`;
+  - it contains "Touch ID request handed to the system; waiting up to ", both new
+    localizedReason strings, "Watching for com.apple.screenIsLocked (selector observer)."
+    and the "(block observer)" fallback line, ", key window: " from the timer, "PANIC at ",
+    the `CLASS_sleepless::platform::LockWatcher` symbols for the defined observer class, and
+    `objc2_exception_helper` (so the guard is linked in);
+  - `Sleepless.app` carries `CFBundleShortVersionString = 0.2.2-beta.4`.
+
 ### What has to be checked on the device (beta4)
 
 1. Enrolment: Touch ID must actually wait for the finger (log shows
