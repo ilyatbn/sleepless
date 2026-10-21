@@ -129,8 +129,8 @@ Tray app: menu items for the same, with the enabled/checked state read through
 - [x] final state: `cargo check --workspace` clean (0 warnings) for
       x86_64-unknown-linux-gnu, x86_64-pc-windows-gnu, aarch64-apple-darwin;
       `cargo test` 10 passed; `cargo build --release` fine.
-- [ ] tag `v0.2.2beta1` pushed -> the workflow builds all three platforms and
-      publishes the pre-release.
+- [x] tag `v0.2.2beta1` pushed; the workflow built Windows / macOS universal / Linux
+      x86_64 + aarch64 and published the pre-release (run 11, success).
 - [ ] device testing (nothing here can do this): the Windows overlay covering
       every monitor and taking focus, the macOS alert above the black windows,
       the Touch ID prompt, and a killed process healing the power settings.
