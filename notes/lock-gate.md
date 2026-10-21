@@ -131,6 +131,9 @@ Tray app: menu items for the same, with the enabled/checked state read through
       `cargo test` 10 passed; `cargo build --release` fine.
 - [x] tag `v0.2.2beta1` pushed; the workflow built Windows / macOS universal / Linux
       x86_64 + aarch64 and published the pre-release (run 11, success).
+- [x] beta 1 field report: every macOS dialog answered as "cancelled" (NSAlert returns
+      1000/1001, not NSModalResponseOK) - fixed, plus the shared log file for reports.
+      Tagged `v0.2.2beta2` (run 12: all jobs success, unit tests now part of CI).
 - [ ] device testing (nothing here can do this): the Windows overlay covering
       every monitor and taking focus, the macOS alert above the black windows,
       the Touch ID prompt, and a killed process healing the power settings.
