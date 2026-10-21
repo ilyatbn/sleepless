@@ -366,6 +366,23 @@ guaranteed way out of Sleepless - which is also the answer to a stuck prompt.
   (prompt under the black windows, or the wrong display); the new logging distinguishes them
   in one line.
 
+### Published: v0.2.2beta3
+
+- Commit `e9d6a51` on `lock-gate`, tag `v0.2.2beta3` ->
+  https://github.com/ilyatbn/sleepless/releases/tag/v0.2.2beta3 (pre-release, not Latest).
+- CI run 13: version / linux x86_64 / linux aarch64 / windows / macos / release all
+  completed success, including the `cargo test --workspace` step on the Linux x86_64 leg.
+- All 8 assets published. Checked against the shipped binaries rather than trusting the
+  build: the macOS `sleepless` contains the new log strings ("Touch ID prompt requested;
+  waiting up to ..s", "Watching for com.apple.screenIsLocked.", "on the display under the
+  pointer (", "Lock screen giving up after ..", "Gate ended without a password: the session
+  was taken over."), and the Windows `sleepless.exe` contains the `SleeplessWatch` class,
+  "Session watch window ready; WTSRegisterSessionNotification -> .." and
+  "Windows locked the session: Sleepless is getting out of the way.".
+- Enrolment was exercised end to end on this machine under a pty with the display
+  variables unset (terminal prompt path): two entries, confirmation, "Password enrolled in
+  <dir>", "No passkey available on this platform", exit 0, and the same lines in the log.
+
 ### What has to be checked on the device (beta3)
 
 1. Enrolment end to end: password, then Touch ID. It must return within 45 s at the worst,
