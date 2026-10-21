@@ -673,6 +673,47 @@ Unsetting `XDG_SESSION_TYPE`/`DISPLAY` does not prevent it. Smoke-test the crede
 commands (`--has-password`, `--clear-password`) instead; `timeout` around a session run
 leaves the display in whatever state the killed process left it.
 
+### Published: v0.2.2beta5
+
+- Commit `710d96d` (+ a notes-only follow-up) on `lock-gate`, tag `v0.2.2beta5` ->
+  https://github.com/ilyatbn/sleepless/releases/tag/v0.2.2beta5 (pre-release, not Latest).
+- CI run 15: version / linux x86_64 / linux aarch64 / windows / macos / release all
+  completed success. Note: the first push of the tag produced **no run at all** (the tag was
+  on the remote and the workflow file had the tag trigger; nothing appeared for 12 minutes).
+  Deleting and re-pushing the tag created run 15 immediately - worth remembering as the fix
+  for a silently dropped tag trigger.
+- Checked in the shipped universal binary (x86_64 + arm64), not in the source:
+  `Sleepless 0.2.2-beta.5`; `defaultCenter` present and `distributedNotificationCenter`
+  **absent**; all the `Screen-lock watch: …` breadcrumbs; `Objective-C exception reporting
+  installed.`; `SleeplessLockWatcher`; `SLEEPLESS_NO_SCREEN_LOCK_WATCH`;
+  `Making one black window per display`; `Stage: the black screen.`; `Showing the pointer
+  again.`; the gate's "no password is enrolled" line; and the imported symbols
+  `objc_setExceptionPreprocessor`, `objc_setUncaughtExceptionHandler` and
+  `objc2_exception_helper_0_1_try_catch` (so the exception guards are linked in).
+- Size cost of `panic = "unwind"` (as expected, and worth knowing): `sleepless.exe` 274 KB ->
+  306 KB, the Linux x86_64 tarball 1.28 MB -> 1.49 MB, the macOS universal CLI 1.13 MB ->
+  1.22 MB.
+
+### Fourth and fifth passes
+
+After the 21 rows above were fixed, two more passes were run over the changed code:
+
+- the fourth found only stale/incorrect comments (a doc comment claiming
+  `raise_above_black_out` tracked "the alert we're currently showing", and a duplicated
+  NSAlert-return paragraph), and one wrong **record in these notes**: the beta4 audit table
+  asserted a `+ (NSDistributedNotificationCenter *)distributedNotificationCenter;`
+  declaration that exists nowhere. It is now struck through rather than quietly edited,
+  because how that claim came to be written down is itself the lesson.
+- the fifth pass re-checked the areas the fixes touched - `store.rs` (no panicking paths:
+  `from_hex` bounds its pairs, the registry read clamps through the error check, the config
+  file is written 0600 via a temp + rename), `lock.rs` (`Secret` zeroes on drop,
+  `enroll_passkey` refuses without a password, `remove()` clears both sections so a
+  passkey-without-password state is not reachable through the CLI), the gate call sites on
+  all three platforms, the selector spelling used by `define_class!` matching the one passed
+  to `addObserver:selector:name:object:` (both `sleeplessSessionLockChanged:`), the watcher
+  registration order in `run()`, and the absence of any remaining `NSApplication::run()`
+  path. Nothing further was found.
+
 ### Things this review could not settle without a Mac
 
 - Whether `+defaultCenter` on a process started by the tray app behaves (it is documented;
