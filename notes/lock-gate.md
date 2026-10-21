@@ -474,12 +474,17 @@ Status: fixed as far as the evidence allows, with several independent layers.
 
 ### Objective-C call audit (everything in src/macos.rs)
 
+*(This beta4 table is kept because it records what was believed at the time, but two rows
+in it are wrong - the distributed-centre selector and the block-observer variant. The
+beta5 section's audit is the authoritative one: it was checked against Apple's docs page
+for the class and against the generated bindings, line by line.)*
+
 Hand-written `msg_send!` - three, all documented, all with the declaration checked against
 the Apple headers / the objc2 generated bindings:
 
 | Call | Apple declaration | Return | Notes |
 | --- | --- | --- | --- |
-| `[NSDistributedNotificationCenter distributedNotificationCenter]` | `+ (NSDistributedNotificationCenter *)distributedNotificationCenter;` | object pointer, taken with `Retained::retain` | no arguments; only hand-written because objc2-app-kit 0.3 has no bindings for this class |
+| ~~`[NSDistributedNotificationCenter distributedNotificationCenter]`~~ | ~~`+ (NSDistributedNotificationCenter *)distributedNotificationCenter;`~~ | *this line was wrong*: that declaration does not exist in any header, and it was asserted rather than checked - the beta5 section's audit replaces it with `+defaultCenter`, which is what Apple documents | **no**: it is the crash (see the beta5 section) |
 | `[app respondsToSelector:@selector(activate)]` | `- (BOOL)respondsToSelector:(SEL)aSelector;` (NSObject) | `BOOL` -> `objc2::runtime::Bool` | guard for the macOS 14 `-activate` |
 | `[LockWatcher class] new` | `+ (instancetype)new;` (NSObject, init family) | converted to `Retained<LockWatcher>` by `msg_send!` | `msg_send_id!` is deprecated in objc2 0.6; plain `msg_send!` does the conversion |
 
